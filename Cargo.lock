@@ -5329,6 +5329,7 @@ dependencies = [
  "ratatui-core",
  "ratatui-widgets",
  "serde",
+ "serde_json",
  "serde_with",
  "strum 0.28.0",
  "syntect",

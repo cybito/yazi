@@ -40,11 +40,11 @@ Yazi is currently in heavy development, expect breaking changes.
 - Usage: https://yazi-rs.github.io/docs/installation
 - Features: https://yazi-rs.github.io/features
 
-## `custom` 分支：输入法切换
+## `custom` 分支：输入法模式上报
 
-前台导航、输入框 Normal 模式使用英文；输入框 Insert/Replace（含帮助搜索和插件输入）恢复进入命令态前的系统输入源。退出、失焦及交给外部程序时尝试恢复；前台命令态每约 100ms 检查用户手动切换的来源。切换失败会提示，不能保证 SIGKILL、系统崩溃或输入法服务不可用时恢复。
+Yazi 只向本机 `ime-control` 服务报告命令态与文本态、焦点和暂停/恢复/退出；帮助搜索、主输入框及插件 alternate input 的 Insert/Replace 模式均属于文本态。客户端与服务使用单条持久 Unix socket 连接（`~/.local/state/infra-as-code/ime-control/run/control.sock`）；服务在实际切换并回读输入源后回复 ACK，Yazi 收到命令态 ACK 前不处理命令键。外部编辑器或 shell 接管终端前同步发送暂停，暂停失败时取消终端让渡，返回后按当前编辑模式恢复。
 
-macOS 依赖 `/opt/homebrew/Cellar/macism/3.1.1/bin/macism`，英文源为 `com.apple.keylayout.ABC`；只恢复鼠须管的系统 source ID，不保存其内部 `ascii_mode`。Linux 本地图形会话优先使用 `fcitx5-remote`，其次 `fcitx-remote`；Fcitx5 恢复方法名及激活状态，Fcitx4 只能恢复激活状态。SSH、无本地图形会话或不可用的输入法服务不更改输入源。
+输入源的采样、英文切换、用户手选来源、恢复与监督全部由服务负责，Yazi 不运行 macism 或 Fcitx 命令、不保存原输入源，也不自行轮询。服务不可用或切换失败时会提示，不能宣称命令态已受保护；SSH/无本地图形会话不建立租约。
 
 ## Discussion
 

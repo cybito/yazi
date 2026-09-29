@@ -1,3 +1,4 @@
+use anyhow::{Result, anyhow};
 use tokio::sync::mpsc;
 use yazi_macro::{emit, relay};
 use yazi_shared::{event::Replier, id::Id, url::UrlBuf};
@@ -12,10 +13,11 @@ impl AppProxy {
 		rx.recv().await;
 	}
 
-	pub async fn stop() {
+	pub async fn stop() -> Result<()> {
 		let (tx, mut rx) = mpsc::unbounded_channel();
 		emit!(Call(relay!(app:stop).with_replier(tx)));
-		rx.recv().await;
+		rx.recv().await.ok_or_else(|| anyhow!("Yazi closed before confirming terminal handoff"))??;
+		Ok(())
 	}
 
 	pub fn stop_with(replier: Option<Replier>) {

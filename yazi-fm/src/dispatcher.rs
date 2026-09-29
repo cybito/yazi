@@ -21,7 +21,11 @@ impl<'a> Dispatcher<'a> {
 			Event::Term(TermEvent::Mouse(mouse)) => self.dispatch_mouse(mouse),
 			Event::Term(TermEvent::Resize(_)) => self.dispatch_resize(),
 			Event::Term(TermEvent::FocusIn) => self.dispatch_focus(),
-			Event::Term(TermEvent::FocusOut) => self.app.core.ime.focus_out(),
+			Event::Term(TermEvent::FocusOut) => {
+				let result = self.app.core.ime.focus_out();
+				self.app.report_ime(result);
+				Ok(())
+			}
 			Event::Term(TermEvent::Paste(str)) => self.dispatch_paste(str),
 			Event::Term(TermEvent::Dnd(dnd)) => self.dispatch_dnd(dnd),
 			Event::Term(TermEvent::Clipboard(clip)) => self.dispatch_clipboard(clip),
@@ -55,6 +59,7 @@ impl<'a> Dispatcher<'a> {
 	}
 
 	fn dispatch_key(&mut self, key: KeyEvent) -> Result<()> {
+		if !self.app.command_ime_ready() { return Ok(()); }
 		Router::new(self.app).route(key)?;
 		Ok(())
 	}
@@ -71,10 +76,11 @@ impl<'a> Dispatcher<'a> {
 
 	fn dispatch_focus(&mut self) -> Result<()> {
 		let editing = self.app.core.editing();
-		let ime_result = self.app.core.ime.focus_in(editing);
+		let result = self.app.core.ime.focus_in(editing);
+		self.app.report_ime(result);
 		let cx = &mut Ctx::active(&mut self.app.core, &mut self.app.term);
 		act!(app:focus, cx)?;
-		ime_result
+		Ok(())
 	}
 
 	fn dispatch_paste(&mut self, str: String) -> Result<()> {

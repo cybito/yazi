@@ -20,8 +20,11 @@ impl Process {
 	}
 
 	pub(crate) async fn block(&self, task: ProcessInBlock) -> Result<(), ProcessOutBlock> {
-		let _permit = Permit::new(YIELD_TO_SUBPROCESS.acquire().await.unwrap(), AppProxy::resume());
-		AppProxy::stop().await;
+		let permit = YIELD_TO_SUBPROCESS.acquire().await.unwrap();
+		if let Err(error) = AppProxy::stop().await {
+			return Ok(self.ops.out(task.id, ProcessOutBlock::Fail(error.to_string())));
+		}
+		let _permit = Permit::new(permit, AppProxy::resume());
 
 		let (id, cmd) = (task.id, task.cmd.clone());
 		let result = super::shell(task.into()).await;

@@ -45,7 +45,10 @@ impl Signals {
 				return false;
 			}
 			SIGTSTP => {
-				yazi_scheduler::AppProxy::stop().await;
+				if let Err(error) = yazi_scheduler::AppProxy::stop().await {
+					error!("Cannot suspend Yazi before job control: {error}");
+					return true;
+				}
 				if unsafe { libc::kill(0, SIGSTOP) } != 0 {
 					error!("Failed to stop the process:\n{}", std::io::Error::last_os_error());
 					yazi_proxy::AppProxy::quit(Default::default());

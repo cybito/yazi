@@ -27,7 +27,7 @@ impl Actor for Inspect {
 		};
 
 		tokio::spawn(async move {
-			let _permit = Permit::new(YIELD_TO_SUBPROCESS.acquire().await.unwrap(), AppProxy::resume());
+			let permit = YIELD_TO_SUBPROCESS.acquire().await.unwrap();
 			let (tx, mut rx) = mpsc::unbounded_channel();
 
 			let buffered = {
@@ -39,7 +39,13 @@ impl Actor for Inspect {
 			};
 
 			// Stop the app and clear the terminal
-			AppProxy::stop().await;
+			if AppProxy::stop().await.is_err() {
+				if let Some(task) = ongoing.lock().get_mut(id) {
+					task.logger = None;
+				}
+				return;
+			}
+			let _permit = Permit::new(permit, AppProxy::resume());
 			writeln!(TTY.writer(), "{}", EraseDisplay::All).ok();
 
 			// Print the buffered logs

@@ -36,7 +36,7 @@ pub(super) fn hide(lua: &Lua) -> mlua::Result<Value> {
 		}
 
 		let permit = YIELD_TO_SUBPROCESS.acquire().await.unwrap();
-		AppProxy::stop().await;
+		AppProxy::stop().await.map_err(|error| error.into_lua_err())?;
 
 		lua.set_named_registry_value("HIDE_PERMIT", Permit::new(permit, AppProxy::resume()))?;
 		lua.named_registry_value::<AnyUserData>("HIDE_PERMIT")

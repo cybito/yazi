@@ -40,6 +40,12 @@ Yazi is currently in heavy development, expect breaking changes.
 - Usage: https://yazi-rs.github.io/docs/installation
 - Features: https://yazi-rs.github.io/features
 
+## `custom` 分支：输入法切换
+
+前台导航、输入框 Normal 模式使用英文；输入框 Insert/Replace（含帮助搜索和插件输入）恢复进入命令态前的系统输入源。退出、失焦及交给外部程序时尝试恢复；前台命令态每约 100ms 检查用户手动切换的来源。切换失败会提示，不能保证 SIGKILL、系统崩溃或输入法服务不可用时恢复。
+
+macOS 依赖 `/opt/homebrew/Cellar/macism/3.1.1/bin/macism`，英文源为 `com.apple.keylayout.ABC`；只恢复鼠须管的系统 source ID，不保存其内部 `ascii_mode`。Linux 本地图形会话优先使用 `fcitx5-remote`，其次 `fcitx-remote`；Fcitx5 恢复方法名及激活状态，Fcitx4 只能恢复激活状态。SSH、无本地图形会话或不可用的输入法服务不更改输入源。
+
 ## Discussion
 
 - Discord Server (English mainly): https://discord.gg/qfADduSdJu

@@ -23,6 +23,7 @@ impl Actor for Stop {
 			});
 			succ!();
 		}
+		let ime_result = cx.ime.stop();
 
 		cx.active_mut().preview.reset_image();
 
@@ -31,6 +32,8 @@ impl Actor for Stop {
 		if let Some(replier) = replier {
 			replier.send(Ok(Data::Nil)).ok();
 		}
+
+		ime_result?;
 
 		succ!();
 	}

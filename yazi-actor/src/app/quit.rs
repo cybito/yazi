@@ -1,4 +1,4 @@
-use std::process;
+use std::{mem, process};
 
 use anyhow::Result;
 use tokio::{join, task};
@@ -23,6 +23,9 @@ impl Actor for Quit {
 		cx.tasks.shutdown();
 		cx.mgr.shutdown();
 		yazi_plugin::shutdown();
+		// Stop the lease before waiting for asynchronous shutdown; exit skips Drop.
+		let mut ime = mem::replace(&mut cx.ime, yazi_core::ime::Ime::disabled());
+		let _ = ime.quit();
 
 		let cwd = cx.mgr.cwd().clone();
 		task::spawn_local(async move {
@@ -35,6 +38,9 @@ impl Actor for Quit {
 			);
 
 			Raterm::stop();
+			if let Err(error) = ime.quit() {
+				eprintln!("Yazi could not restore the input method: {error}");
+			}
 			process::exit(opt.code);
 		});
 

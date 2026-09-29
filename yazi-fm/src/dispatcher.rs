@@ -21,7 +21,7 @@ impl<'a> Dispatcher<'a> {
 			Event::Term(TermEvent::Mouse(mouse)) => self.dispatch_mouse(mouse),
 			Event::Term(TermEvent::Resize(_)) => self.dispatch_resize(),
 			Event::Term(TermEvent::FocusIn) => self.dispatch_focus(),
-			Event::Term(TermEvent::FocusOut) => Ok(()),
+			Event::Term(TermEvent::FocusOut) => self.app.core.ime.focus_out(),
 			Event::Term(TermEvent::Paste(str)) => self.dispatch_paste(str),
 			Event::Term(TermEvent::Dnd(dnd)) => self.dispatch_dnd(dnd),
 			Event::Term(TermEvent::Clipboard(clip)) => self.dispatch_clipboard(clip),
@@ -70,8 +70,11 @@ impl<'a> Dispatcher<'a> {
 	}
 
 	fn dispatch_focus(&mut self) -> Result<()> {
+		let editing = self.app.core.editing();
+		let ime_result = self.app.core.ime.focus_in(editing);
 		let cx = &mut Ctx::active(&mut self.app.core, &mut self.app.term);
-		act!(app:focus, cx).map(|_| ())
+		act!(app:focus, cx)?;
+		ime_result
 	}
 
 	fn dispatch_paste(&mut self, str: String) -> Result<()> {

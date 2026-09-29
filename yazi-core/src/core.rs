@@ -3,7 +3,7 @@ use yazi_shared::Layer;
 use yazi_shim::ratatui::Padable;
 use yazi_tty::sequence::SetCursorStyle;
 
-use crate::{cmp::Cmp, confirm::Confirm, help::Help, input::{Input, InputGuard}, mgr::Mgr, notify::Notify, pick::Pick, tab::Tab, tasks::Tasks, which::Which};
+use crate::{cmp::Cmp, confirm::Confirm, help::Help, ime::Ime, input::{Input, InputGuard}, mgr::Mgr, notify::Notify, pick::Pick, tab::Tab, tasks::Tasks, which::Which};
 
 pub struct Core {
 	pub mgr:     Mgr,
@@ -15,6 +15,7 @@ pub struct Core {
 	pub cmp:     Cmp,
 	pub which:   Which,
 	pub notify:  Notify,
+	pub ime:     Ime,
 }
 
 impl Core {
@@ -29,6 +30,7 @@ impl Core {
 			cmp:     Default::default(),
 			which:   Default::default(),
 			notify:  Default::default(),
+			ime:     Ime::new(),
 		}
 	}
 
@@ -48,6 +50,9 @@ impl Core {
 
 		None
 	}
+
+	/// Match the key's pre-routing text receivers, not the overlay's top-level layer.
+	pub fn editing(&self) -> bool { editing_receivers(&self.help, &self.input) }
 
 	pub fn layer(&self) -> Layer {
 		if self.which.active {
@@ -78,4 +83,45 @@ impl Core {
 
 	#[inline]
 	pub fn active_mut(&mut self) -> &mut Tab { self.mgr.active_mut() }
+}
+
+/// Overlays do not change the fact that Router offers text to Help and Input first.
+fn editing_receivers(help: &Help, input: &Input) -> bool {
+	use yazi_widgets::input::InputMode;
+
+	if help.visible && help.input.mode() != InputMode::Normal {
+		return true;
+	}
+	input.lock().is_some_and(|guard| guard.mode() != InputMode::Normal)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::input::InputAlt;
+	use yazi_widgets::input::InputArc;
+
+	#[test]
+	fn text_receiver_priority_follows_help_main_and_plugin_modes() -> anyhow::Result<()> {
+		let mut help = Help::default();
+		let mut input = Input::default();
+		assert!(!editing_receivers(&help, &input));
+
+		input.main.visible = true;
+		assert!(editing_receivers(&help, &input));
+		input.main.escape(())?;
+		assert!(!editing_receivers(&help, &input));
+
+		help.visible = true;
+		assert!(editing_receivers(&help, &input));
+		help.input.escape(())?;
+		assert!(!editing_receivers(&help, &input));
+
+		input.main.visible = false;
+		input.alt = Some(InputAlt::from(&InputArc::default()));
+		assert!(editing_receivers(&help, &input));
+		input.alt.as_ref().unwrap().lock().escape(())?;
+		assert!(!editing_receivers(&help, &input));
+		Ok(())
+	}
 }

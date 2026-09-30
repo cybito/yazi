@@ -49,7 +49,7 @@ impl App {
 
 		guard.finish(self.core.cursor());
 		// Full rendering can register a plugin's focused alt input after dispatch.
-		self.sync_ime();
+		self.sync_ime()?;
 		succ!();
 	}
 

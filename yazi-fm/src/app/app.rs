@@ -36,7 +36,7 @@ impl App {
 
 		let mut app = Self::make(term)?;
 		app.bootstrap()?;
-		app.sync_ime();
+		app.sync_ime()?;
 
 		let mut rx = Event::take();
 		loop {
@@ -74,7 +74,7 @@ impl App {
 
 	fn dispatch(&mut self, event: Event) -> Result<()> {
 		Dispatcher::new(self).dispatch(event);
-		self.sync_ime();
+		self.sync_ime()?;
 
 		self.schedule_render()
 	}
@@ -91,10 +91,10 @@ impl App {
 		}
 		Ok(())
 	}
-	pub(super) fn sync_ime(&mut self) {
-		let editing = self.core.editing();
-		let result = self.core.ime.sync(editing);
-		self.report_ime(result);
+	pub(super) fn sync_ime(&mut self) -> Result<()> {
+		// A missing or rejected ACK must terminate the TUI, not trap the user
+		// behind a command-key gate with no working quit key.
+		self.core.ime.sync(self.core.editing())
 	}
 
 	/// The daemon's ACK, not the requested mode, authorizes a command key.

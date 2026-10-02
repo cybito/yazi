@@ -1,204 +1,211 @@
-//! Reports Yazi's text/command mode to the local ime-control service.
-//! Input-source ownership, readback, and supervision belong exclusively to the service.
-
-#[cfg(unix)]
-use std::env;
+//! Reports Yazi's text/command mode through one persistent intent connection.
+//! Source ownership and readback belong to ime-control, never to Yazi or a Herdr server.
 
 use anyhow::Result;
-#[cfg(unix)]
-use anyhow::bail;
 
 #[cfg(unix)]
-use std::{io::{BufRead, BufReader, IsTerminal, Write}, os::unix::net::UnixStream, path::PathBuf, time::Duration};
+use std::{env, io::IsTerminal};
 #[cfg(unix)]
-use serde::Deserialize;
+use transport::{AckScope, Connection, Transport};
 
 #[cfg(unix)]
-const MAX_FRAME: usize = 4096;
-#[cfg(unix)]
-const TIMEOUT: Duration = Duration::from_secs(3);
+mod transport;
 
-#[cfg(unix)]
-#[derive(Deserialize)]
-struct Response<'a> {
-	ok:         bool,
-	generation: u64,
-	session:    Option<&'a str>,
-	error:      Option<&'a str>,
-}
-
-/// A persistent connection is one service lease. `state` is only the last ACKed
-/// mode; an error never authorizes a command key or suppresses a later retry.
+/// Background sync can update an acknowledged mode, but cannot start a focus
+/// episode. A failed transport is terminal: uncertain source operations are not retried.
 pub struct Ime {
 	enabled:    bool,
 	running:    bool,
 	focused:    bool,
+	suspended:  bool,
 	state:      Option<bool>,
+	failure:    Option<String>,
 	last_error: Option<String>,
 	#[cfg(unix)]
-	connection: Option<BufReader<UnixStream>>,
+	transport:  Option<Transport>,
 	#[cfg(unix)]
-	session:    Option<String>,
+	connection: Option<Connection>,
 }
 
 impl Ime {
 	pub fn new() -> Self {
+		#[cfg(unix)]
+		let selected = Transport::select(|key| env::var_os(key), Self::local_session);
+		#[cfg(unix)]
+		let (transport, failure) = match selected {
+			Ok(transport) => (transport, None),
+			Err(error) => (None, Some(error.to_string())),
+		};
+		#[cfg(unix)]
+		let enabled = transport.is_some() || failure.is_some();
+		#[cfg(not(unix))]
+		let failure = std::env::var_os("HERDR_IME_INTENT").map(|_| "HERDR_IME_UNSUPPORTED_PLATFORM: intent transport requires Unix".to_owned());
+		#[cfg(not(unix))]
+		let enabled = failure.is_some();
 		Self {
-			enabled: Self::local_session(), running: true, focused: true, state: None, last_error: None,
+			enabled, running: true, focused: false, suspended: false, state: None, failure, last_error: None,
+			#[cfg(unix)]
+			transport,
 			#[cfg(unix)]
 			connection: None,
-			#[cfg(unix)]
-			session: None,
 		}
 	}
 
+	#[cfg(unix)]
 	fn local_session() -> bool {
-		#[cfg(unix)]
-		{
-			// Only an interactive local terminal can acquire a GUI input-source lease.
-			if !std::io::stdin().is_terminal() { return false; }
-			// A remote SSH pane must never touch its local host's input source.
-			if ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"].into_iter().any(|key| env::var_os(key).is_some()) {
-				return false;
-			}
-			if cfg!(target_os = "linux") {
-				return ["DISPLAY", "WAYLAND_DISPLAY"].into_iter().any(|key| env::var_os(key).is_some_and(|v| !v.is_empty()));
-			}
-			cfg!(target_os = "macos")
+		if !std::io::stdin().is_terminal() { return false; }
+		if ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"].into_iter().any(|key| env::var_os(key).is_some()) {
+			return false;
 		}
-		#[cfg(not(unix))]
-		{ false }
-	}
-
-	#[cfg(unix)]
-	fn socket_path() -> Result<PathBuf> {
-		let home = env::var_os("HOME").filter(|home| !home.is_empty())
-			.ok_or_else(|| anyhow::anyhow!("HOME is unavailable for the IME control socket"))?;
-		let home = PathBuf::from(home);
-		if !home.is_absolute() { bail!("HOME is not absolute for the IME control socket"); }
-		Ok(home.join(".local/state/infra-as-code/ime-control/run/control.sock"))
-	}
-
-	#[cfg(unix)]
-	fn request(&mut self, request: &'static [u8]) -> Result<()> {
-		let result = (|| {
-			if self.connection.is_none() {
-				let stream = UnixStream::connect(Self::socket_path()?)
-					.map_err(|error| anyhow::anyhow!("IME control socket unavailable: {error}"))?;
-				stream.set_read_timeout(Some(TIMEOUT))?;
-				stream.set_write_timeout(Some(TIMEOUT))?;
-				self.connection = Some(BufReader::new(stream));
-				self.session = None;
-			}
-			let connection = self.connection.as_mut().expect("IME connection established");
-			connection.get_mut().write_all(request)?;
-
-			// Preserve framing across reads; reject oversized, incomplete and malformed ACKs.
-			let mut frame = [0u8; MAX_FRAME];
-			let mut length = 0;
-			loop {
-				let available = connection.fill_buf()?;
-				if available.is_empty() { bail!("IME control disconnected before ACK"); }
-				let count = available.iter().position(|&byte| byte == b'\n').map_or(available.len(), |end| end + 1);
-				if length + count > MAX_FRAME { bail!("IME control ACK exceeds 4096 bytes"); }
-				frame[length..length + count].copy_from_slice(&available[..count]);
-				length += count;
-				connection.consume(count);
-				if frame[length - 1] == b'\n' { break; }
-			}
-			let response: Response = serde_json::from_slice(&frame[..length])?;
-			let _generation = response.generation;
-			if !response.ok {
-				bail!("IME control rejected request: {}", response.error.unwrap_or("unknown error"));
-			}
-			let session = response.session.filter(|session| !session.is_empty())
-				.ok_or_else(|| anyhow::anyhow!("IME control ACK omitted its session"))?;
-			if let Some(previous) = &self.session {
-				if previous != session { bail!("IME control changed session on an existing connection"); }
-			} else {
-				self.session = Some(session.to_owned());
-			}
-			Ok(())
-		})();
-		if result.is_err() {
-			// Releasing the socket lets the daemon release an uncertain lease.
-			self.connection = None;
-			self.session = None;
-			self.state = None;
+		if cfg!(target_os = "linux") {
+			return ["DISPLAY", "WAYLAND_DISPLAY"].into_iter().any(|key| env::var_os(key).is_some_and(|value| !value.is_empty()));
 		}
-		result
+		cfg!(target_os = "macos")
 	}
 
-	#[cfg(not(unix))]
-	fn request(&mut self, _: &'static [u8]) -> Result<()> { unreachable!("non-Unix IME reporter is disabled") }
-
-	fn activate(&mut self, editing: bool) -> Result<()> {
-		self.request(if editing { b"{\"op\":\"activate\",\"state\":\"text\",\"policy\":\"mode\"}\n" }
-			else { b"{\"op\":\"activate\",\"state\":\"command\",\"policy\":\"mode\"}\n" })?;
-		self.state = Some(editing);
+	fn check_failure(&self) -> Result<()> {
+		if let Some(error) = &self.failure { anyhow::bail!("{error}"); }
 		Ok(())
 	}
 
-	pub fn sync(&mut self, editing: bool) -> Result<()> {
-		if !self.enabled || !self.running || !self.focused { return Ok(()); }
-		match self.state {
-			None => self.activate(editing),
-			Some(current) if current != editing => {
-				self.request(if editing { b"{\"op\":\"state\",\"state\":\"text\"}\n" }
-					else { b"{\"op\":\"state\",\"state\":\"command\"}\n" })?;
-				self.state = Some(editing);
-				Ok(())
+	#[cfg(unix)]
+	fn request(&mut self, request: &'static [u8]) -> Result<AckScope> {
+		self.check_failure()?;
+		let result = (|| {
+			if self.connection.is_none() {
+				self.connection = Some(Connection::connect(self.transport.as_ref()
+					.ok_or_else(|| anyhow::anyhow!("IME transport is unavailable"))?)?);
 			}
-			_ => Ok(()),
+			self.connection.as_mut().expect("IME connection established").request(request)
+		})();
+		if let Err(error) = &result { self.fail(error); }
+		result
+	}
+
+	#[cfg(unix)]
+	fn fail(&mut self, error: &anyhow::Error) {
+		// EOF releases only this connection; no render or key replays its stale mode.
+		self.connection = None;
+		self.state = None;
+		self.focused = false;
+		self.failure = Some(error.to_string());
+	}
+
+	#[cfg(unix)]
+	fn acknowledge(&mut self, editing: bool, scope: AckScope) {
+		if matches!(scope, AckScope::Applied | AckScope::Recorded) {
+			self.state = Some(editing);
+		} else {
+			self.focused = false;
+			self.state = None;
 		}
 	}
 
-	/// A blur or suspend has no command ACK, even if a prior mode was command.
+	fn activate(&mut self, editing: bool) -> Result<()> {
+		self.check_failure()?;
+		#[cfg(unix)]
+		{
+			let scope = self.request(if editing { b"{\"op\":\"activate\",\"state\":\"text\",\"policy\":\"mode\"}\n" }
+				else { b"{\"op\":\"activate\",\"state\":\"command\",\"policy\":\"mode\"}\n" })?;
+			self.acknowledge(editing, scope);
+		}
+		Ok(())
+	}
+
+	/// Called after dispatch/render. Never acquires a lease or restores a lost episode.
+	pub fn sync(&mut self, editing: bool) -> Result<()> {
+		self.check_failure()?;
+		if !self.enabled || !self.running || !self.focused { return Ok(()); }
+		#[cfg(unix)]
+		if self.state.is_some_and(|current| current != editing) {
+			let scope = self.request(if editing { b"{\"op\":\"state\",\"state\":\"text\"}\n" }
+				else { b"{\"op\":\"state\",\"state\":\"command\"}\n" })?;
+			self.acknowledge(editing, scope);
+		}
+		Ok(())
+	}
+
+	/// Genuine terminal input samples the current editing classifier, not a cached mode.
+	pub fn input(&mut self, editing: bool) -> Result<()> {
+		self.check_failure()?;
+		if !self.enabled || !self.running { return Ok(()); }
+		if !self.focused || self.state.is_none() { return self.focus_in(editing); }
+		#[cfg(unix)]
+		if !matches!(self.transport.as_ref(), Some(Transport::Herdr { .. })) {
+			// The compositor may have released a direct owner without a TUI focus event.
+			// Only this genuine input may explicitly resume its freshly sampled mode.
+			return self.resume_intent(editing);
+		}
+		#[cfg(unix)]
+		if let Some(connection) = &self.connection
+			&& let Err(error) = connection.alive()
+		{
+			self.fail(&error);
+			return Err(error);
+		}
+		self.sync(editing)
+	}
+
+	/// Direct protection requires applied; Herdr recorded authorizes only reporting,
+	/// with source gating performed by the attached client before it sends this key.
 	pub fn command_ready(&self) -> bool {
-		!self.enabled || (self.running && self.focused && self.state == Some(false))
+		!self.enabled || (self.failure.is_none() && self.running && self.focused && self.state == Some(false))
 	}
 
 	pub fn focus_out(&mut self) -> Result<()> {
 		self.focused = false;
 		self.state = None;
+		self.check_failure()?;
 		if !self.enabled { return Ok(()); }
 		#[cfg(unix)]
-		if self.connection.is_none() { return Ok(()); }
-		self.request(b"{\"op\":\"blur\"}\n")
-	}
-
-	pub fn focus_in(&mut self, editing: bool) -> Result<()> {
-		self.focused = true;
-		self.sync(editing)
-	}
-
-	pub fn stop(&mut self) -> Result<()> {
-		if !self.enabled {
-			self.running = false;
-			self.state = None;
-			return Ok(());
-		}
-		#[cfg(unix)]
-		if self.connection.is_none() {
-			self.running = false;
-			self.state = None;
-			return Ok(());
-		}
-		self.request(b"{\"op\":\"suspend\"}\n")?;
-		self.running = false;
-		self.state = None;
+		if self.connection.is_some() { self.request(b"{\"op\":\"blur\"}\n")?; }
 		Ok(())
 	}
 
-	pub fn resume(&mut self, editing: bool) -> Result<()> {
+	pub fn focus_in(&mut self, editing: bool) -> Result<()> {
+		self.check_failure()?;
+		self.focused = true;
+		if self.suspended && self.running { return self.resume_intent(editing); }
+		if !self.enabled || !self.running { return Ok(()); }
+		self.activate(editing)
+	}
+
+	pub fn stop(&mut self) -> Result<()> {
+		self.check_failure()?;
+		#[cfg(unix)]
+		if self.enabled && self.connection.is_some() {
+			let scope = self.request(b"{\"op\":\"suspend\"}\n")?;
+			if !matches!(scope, AckScope::Applied | AckScope::Recorded) {
+				let error = anyhow::anyhow!("IME_BAD_ACK: terminal handoff release was not acknowledged");
+				self.fail(&error);
+				return Err(error);
+			}
+		}
+		self.running = false;
+		self.focused = false;
+		self.state = None;
+		self.suspended = true;
+		Ok(())
+	}
+
+	/// Terminal/UI return is not evidence of foreground input or focus.
+	pub fn resume(&mut self) -> Result<()> {
+		self.check_failure()?;
+		self.running = true;
+		Ok(())
+	}
+
+	fn resume_intent(&mut self, editing: bool) -> Result<()> {
+		self.check_failure()?;
 		self.running = true;
 		self.focused = true;
+		self.suspended = false;
 		if !self.enabled { return Ok(()); }
 		#[cfg(unix)]
 		if self.connection.is_some() {
-			self.request(if editing { b"{\"op\":\"resume\",\"state\":\"text\"}\n" }
+			let scope = self.request(if editing { b"{\"op\":\"resume\",\"state\":\"text\"}\n" }
 				else { b"{\"op\":\"resume\",\"state\":\"command\"}\n" })?;
-			self.state = Some(editing);
+			self.acknowledge(editing, scope);
 			return Ok(());
 		}
 		self.activate(editing)
@@ -206,20 +213,23 @@ impl Ime {
 
 	pub fn quit(&mut self) -> Result<()> {
 		self.running = false;
+		self.focused = false;
 		self.state = None;
-		if !self.enabled { return Ok(()); }
-		#[cfg(unix)]
-		if self.connection.is_none() { return Ok(()); }
-		let result = self.request(b"{\"op\":\"close\"}\n");
+		let mut result = self.check_failure();
 		#[cfg(unix)]
 		{
+			if result.is_ok() && self.enabled && self.connection.is_some() {
+				result = self.request(b"{\"op\":\"close\"}\n").and_then(|scope| {
+					if matches!(scope, AckScope::Applied | AckScope::Recorded) { Ok(()) }
+					else { anyhow::bail!("IME_BAD_ACK: close release was not acknowledged") }
+				});
+			}
 			self.connection = None;
-			self.session = None;
 		}
 		result
 	}
 
-	/// Notify once per distinct error. An unsuccessful operation never counts as protection.
+	/// Notify once per distinct error. Inactive is normal background state, not an error.
 	pub fn report(&mut self, result: Result<()>) -> Option<String> {
 		match result {
 			Ok(()) => { self.last_error = None; None }
@@ -238,7 +248,6 @@ impl Default for Ime {
 
 impl Drop for Ime {
 	fn drop(&mut self) {
-		// Closing the connection releases the lease even if Yazi exits unexpectedly.
 		#[cfg(unix)]
 		{ self.connection = None; }
 	}

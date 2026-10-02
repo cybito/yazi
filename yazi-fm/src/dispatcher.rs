@@ -2,7 +2,7 @@ use anyhow::Result;
 use yazi_actor::Ctx;
 use yazi_macro::{act, emit, warn};
 use yazi_shared::event::{ActionCow, Event};
-use yazi_term::event::{ClipboardEvent, DndEvent, Event as TermEvent, KeyEvent, MouseEvent};
+use yazi_term::event::{ClipboardEvent, DndEvent, Event as TermEvent, KeyEvent, KeyEventKind, MouseEvent};
 
 use crate::{Executor, Router, app::App};
 
@@ -59,7 +59,9 @@ impl<'a> Dispatcher<'a> {
 	}
 
 	fn dispatch_key(&mut self, key: KeyEvent) -> Result<()> {
-		if !self.app.command_ime_ready() { return Ok(()); }
+		// Key bindings do not distinguish release, so it cannot start an input episode.
+		if key.kind == KeyEventKind::Release { return Ok(()); }
+		if !self.app.input_ime_ready() { return Ok(()); }
 		Router::new(self.app).route(key)?;
 		Ok(())
 	}
@@ -84,6 +86,7 @@ impl<'a> Dispatcher<'a> {
 	}
 
 	fn dispatch_paste(&mut self, str: String) -> Result<()> {
+		if !self.app.input_ime_ready() { return Ok(()); }
 		if let Some(mut guard) = self.app.core.input.lock_mut() {
 			guard.feed(str.into())?;
 		}

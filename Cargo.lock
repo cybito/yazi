@@ -5324,6 +5324,7 @@ dependencies = [
  "dyn-clone",
  "hashbrown 0.17.1",
  "indexmap 2.14.1",
+ "libc",
  "mlua",
  "parking_lot",
  "ratatui-core",

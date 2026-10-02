@@ -18,8 +18,7 @@ impl Actor for Resume {
 
 		drop(cx.term.take());
 		*cx.term = Some(Raterm::start()?);
-		let editing = cx.core.editing();
-		let ime_result = cx.ime.resume(editing);
+		let ime_result = cx.ime.resume();
 
 		// While the app resumes, it's possible that the terminal size has changed.
 		// We need to trigger a resize, and render the UI based on the resized area.

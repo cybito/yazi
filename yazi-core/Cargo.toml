@@ -49,3 +49,6 @@ syntect         = { workspace = true }
 tokio           = { workspace = true }
 unicode-width   = { workspace = true }
 yazi-prebuilt   = "0.1.0"
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }

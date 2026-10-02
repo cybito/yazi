@@ -42,9 +42,9 @@ Yazi is currently in heavy development, expect breaking changes.
 
 ## `custom` 分支：输入法模式上报
 
-Yazi 只向本机 `ime-control` 服务报告命令态与文本态、焦点和暂停/恢复/退出；帮助搜索、主输入框及插件 alternate input 的 Insert/Replace 模式均属于文本态。客户端与服务使用单条持久 Unix socket 连接（`~/.local/state/infra-as-code/ime-control/run/control.sock`）；服务在实际切换并回读输入源后回复 ACK，Yazi 收到命令态 ACK 前不处理命令键。外部编辑器或 shell 接管终端前同步发送暂停，暂停失败时取消终端让渡，返回后按当前编辑模式恢复。
+Yazi 向 `ime-control` 或 Herdr 报告命令态与文本态、焦点和暂停/恢复/退出；帮助搜索、主输入框及插件 alternate input 的 Insert/Replace 模式均属于文本态。无 Herdr marker 时，本地图形终端使用持久 Unix socket（`~/.local/state/infra-as-code/ime-control/run/control.sock`），命令键等待服务切换／回读完成的 `scope:applied` ACK。`HERDR_IME_INTENT=1` 与 `HERDR_ENV=1` 先于 GUI/SSH 判定选择 `pane.input_intent.stream`，必须有可信 `HERDR_SOCKET_PATH` 和互斥的 pane/Popup identity；`scope:recorded` 仅表示 server 保存了意图，聚焦 client 自行等待本机 applied ACK。非法／矛盾 marker 拒绝，不回退至 server 输入源。外部编辑器或 shell 接管前同步暂停，暂停失败取消让渡；child 返回或 SIGCONT 不自动恢复前台意图，下一个真实 key/FocusIn 才按当前编辑模式恢复。
 
-输入源的采样、英文切换、用户手选来源、恢复与监督全部由服务负责，Yazi 不运行 macism 或 Fcitx 命令、不保存原输入源，也不自行轮询。本地图形终端的服务不可用或切换/回读失败会报错并退出 TUI，不能继续在无命令态 ACK 的界面中困住用户；SSH/无本地图形会话不建立租约。
+输入源的采样、英文切换、用户手选、恢复与监督全部由本机服务负责，Yazi 不运行 macism/Fcitx 命令、不保存原源，也不自行轮询；text 只释放暂态英文，不强制中文。直接模式的服务不可用或切换／回读失败会报错并退出 TUI，不能留下命令键被阻断却无法退出的界面；无 marker 的 SSH／无本地图形会话不建立 lease。Herdr server 与 client 均须显式启用 `[experimental].ime_control`，该源码候选不等于已部署或真实 GUI 验收。
 
 ## Discussion
 

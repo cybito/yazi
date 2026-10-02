@@ -36,7 +36,8 @@ impl App {
 
 		let mut app = Self::make(term)?;
 		app.bootstrap()?;
-		app.sync_ime()?;
+		let editing = app.core.editing();
+		app.core.ime.focus_in(editing)?;
 
 		let mut rx = Event::take();
 		loop {
@@ -97,11 +98,11 @@ impl App {
 		self.core.ime.sync(self.core.editing())
 	}
 
-	/// The daemon's ACK, not the requested mode, authorizes a command key.
-	pub(crate) fn command_ime_ready(&mut self) -> bool {
-		if self.core.editing() { return true; }
-		let result = self.core.ime.sync(false);
-		let ready = result.is_ok() && self.core.ime.command_ready();
+	/// Genuine terminal input can start a new episode; render/business sync cannot.
+	pub(crate) fn input_ime_ready(&mut self) -> bool {
+		let editing = self.core.editing();
+		let result = self.core.ime.input(editing);
+		let ready = result.is_ok() && (editing || self.core.ime.command_ready());
 		self.report_ime(result);
 		ready
 	}

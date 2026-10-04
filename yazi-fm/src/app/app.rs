@@ -1,11 +1,17 @@
-use std::{sync::atomic::Ordering, time::{Duration, Instant}};
+use std::{
+	sync::atomic::Ordering,
+	time::{Duration, Instant},
+};
 
 use anyhow::Result;
 use tokio::time::sleep;
 use yazi_actor::Ctx;
-use yazi_core::{Core, notify::{MessageLevel, MessageOpt}};
-use yazi_macro::{act, render, succ, warn};
-use yazi_shared::{data::Data, event::{Event, EventRx, NEED_RENDER}};
+use yazi_core::Core;
+use yazi_macro::{act, render, succ};
+use yazi_shared::{
+	data::Data,
+	event::{Event, EventRx, NEED_RENDER},
+};
 use yazi_tui::Raterm;
 
 use crate::Dispatcher;
@@ -16,7 +22,7 @@ pub(crate) struct App {
 
 	pub(super) need_render: u8,
 	pub(crate) last_render: Instant,
-	next_render:            Option<Duration>,
+	next_render: Option<Duration>,
 }
 
 impl App {
@@ -93,30 +99,14 @@ impl App {
 		Ok(())
 	}
 	pub(super) fn sync_ime(&mut self) -> Result<()> {
-		// A missing or rejected ACK must terminate the TUI, not trap the user
-		// behind a command-key gate with no working quit key.
+		// Reporter failure disables only the optional enhancement, never the TUI.
 		self.core.ime.sync(self.core.editing())
 	}
 
 	/// Genuine terminal input can start a new episode; render/business sync cannot.
 	pub(crate) fn input_ime_ready(&mut self) -> bool {
 		let editing = self.core.editing();
-		let result = self.core.ime.input(editing);
-		let ready = result.is_ok() && (editing || self.core.ime.command_ready());
-		self.report_ime(result);
-		ready
-	}
-
-	pub(crate) fn report_ime(&mut self, result: Result<()>) {
-		if let Some(message) = self.core.ime.report(result) {
-			warn!("IME: {message}");
-			let cx = &mut Ctx::active(&mut self.core, &mut self.term);
-			act!(notify:push, cx, MessageOpt {
-				title: "Input method".to_owned(),
-				content: message,
-				level: MessageLevel::Warn,
-				timeout: Duration::from_secs(8),
-			}).ok();
-		}
+		self.core.ime.input(editing).ok();
+		editing || self.core.ime.command_ready()
 	}
 }

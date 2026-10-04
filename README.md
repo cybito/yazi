@@ -42,11 +42,11 @@ Yazi is currently in heavy development, expect breaking changes.
 
 ## `custom` 分支：输入法模式上报
 
-Yazi 向 `ime-control` 或 Herdr 报告命令态与文本态、焦点和暂停/恢复/退出；帮助搜索、主输入框及插件 alternate input 的 Insert/Replace 模式均属于文本态。无 Herdr marker 时，本地图形终端使用持久 Unix socket（`~/.local/state/infra-as-code/ime-control/run/control.sock`），命令键等待服务切换／回读完成的 `scope:applied` ACK。`HERDR_IME_INTENT=1` 与 `HERDR_ENV=1` 先于 GUI/SSH 判定选择 `pane.input_intent.stream`，必须有可信 `HERDR_SOCKET_PATH` 和互斥的 pane/Popup identity；`scope:recorded` 仅表示 server 保存了意图，聚焦 client 自行等待本机 applied ACK。非法／矛盾 marker 拒绝，不回退至 server 输入源。外部编辑器或 shell 接管前同步暂停，暂停失败取消让渡；child 返回或 SIGCONT 不自动恢复前台意图，下一个真实 key/FocusIn 才按当前编辑模式恢复。
+Yazi 可选地向 `ime-control` 或 Herdr 报告命令态与文本态、焦点和暂停/恢复/退出；帮助搜索、主输入框及插件 alternate input 的 Insert/Replace 模式均属于文本态。无 Herdr marker 时，本地图形终端使用持久 Unix socket（`~/.local/state/infra-as-code/ime-control/run/control.sock`），启用期间命令键等待服务切换／回读完成的 `scope:applied` ACK。`HERDR_IME_INTENT=1` 与 `HERDR_ENV=1` 先于 GUI/SSH 判定选择 `pane.input_intent.stream`，必须有可信 `HERDR_SOCKET_PATH` 和互斥的 pane/Popup identity；`scope:recorded` 仅表示 server 保存了意图，聚焦 client 自行等待本机 applied ACK。非法／矛盾 marker 禁用 reporter，不回退至本地主机 daemon 或 server 输入源。外部编辑器或 shell 接管前同步暂停；reporter 暂停失败时关闭连接，普通终端让渡仍继续。child 返回或 SIGCONT 不自动恢复前台意图，下一个真实 key/FocusIn 才按当前编辑模式恢复。
 
 完整请求（写入至读完 ACK）共享 4 秒期限，分片不会续期。对端发完最终 ACK 后立即关闭是合法生命周期；Yazi 会先消费完整 ACK，再使已关闭连接的缓存授权失效。
 
-输入源的采样、英文切换、用户手选、恢复与监督全部由本机服务负责，Yazi 不运行 macism/Fcitx 命令、不保存原源，也不自行轮询；text 只释放暂态英文，不强制中文。直接模式的服务不可用或切换／回读失败会报错并退出 TUI，不能留下命令键被阻断却无法退出的界面；无 marker 的 SSH／无本地图形会话不建立 lease。Herdr server 与 client 均须显式启用 `[experimental].ime_control`，该源码候选不等于已部署或真实 GUI 验收。
+输入源的采样、英文切换、用户手选、恢复与监督全部由本机服务负责，Yazi 不运行 macism/Fcitx 命令、不保存原源，也不自行轮询；text 只释放暂态英文，不强制中文。transport 选择、平台、marker、socket、peer、ACK、焦点或后端失败（包括 `FOCUS_UNVERIFIED` / `BACKEND_UNAVAILABLE`）会静默关闭本进程 reporter、清空缓存意图，直到下次启动才重新尝试；当前按键、搜索文本、Esc/q、暂停/恢复、外部 child 与退出均继续普通 CLI 行为，不弹通知或输出缺失组件错误。这种退化不表示 applied、recorded 或英文保护；正常 `inactive` 仍保持后台保护边界，不永久禁用 reporter。无 marker 的 SSH／无本地图形会话不建立 lease。Herdr server 与 client 均须显式启用 `[experimental].ime_control`，该源码候选不等于已部署或真实 GUI 验收。
 
 ## Discussion
 

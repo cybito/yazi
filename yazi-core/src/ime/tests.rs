@@ -1,15 +1,86 @@
-use std::{ffi::OsString, fs, io::{BufRead, BufReader, Write}, os::unix::{fs::{DirBuilderExt, PermissionsExt, symlink}, net::{UnixListener, UnixStream}}, path::PathBuf, sync::{atomic::{AtomicU64, Ordering}, mpsc}, thread, time::Duration};
+use std::{
+	ffi::OsString,
+	fs,
+	io::{BufRead, BufReader, Write},
+	os::unix::{
+		fs::{DirBuilderExt, PermissionsExt, symlink},
+		net::{UnixListener, UnixStream},
+	},
+	path::PathBuf,
+	sync::{
+		atomic::{AtomicU64, Ordering},
+		mpsc,
+	},
+	thread,
+	time::Duration,
+};
 
 use anyhow::Result;
 use serde_json::{Value, json};
 
-use super::{Ime, transport::{Connection, Transport}};
+use super::{
+	Ime,
+	transport::{Connection, Transport},
+};
 
 fn reporter(client: UnixStream) -> Ime {
 	Ime {
-		enabled: true, running: true, focused: false, suspended: false, state: None, failure: None, last_error: None,
-		transport: None, connection: Some(Connection::from_stream(client, false)),
+		enabled: true,
+		running: true,
+		focused: false,
+		suspended: false,
+		state: None,
+		transport: None,
+		connection: Some(Connection::from_stream(client, false)),
 	}
+}
+
+fn assert_disabled(ime: &mut Ime) -> Result<()> {
+	assert!(!ime.enabled);
+	assert!(ime.connection.is_none());
+	assert!(ime.transport.is_none());
+	assert!(ime.state.is_none(), "ordinary input is not an applied or recorded ACK");
+	assert!(!ime.focused);
+	assert!(ime.command_ready(), "disabled reporter must dispatch the current command key");
+	ime.sync(true)?;
+	ime.focus_in(true)?;
+	ime.input(false)?;
+	ime.input(true)?;
+	ime.focus_out()?;
+	ime.stop()?;
+	assert!(!ime.running);
+	ime.resume()?;
+	assert!(ime.running);
+	ime.input(false)?;
+	ime.quit()?;
+	assert!(ime.state.is_none());
+	assert!(ime.connection.is_none());
+	assert!(!ime.enabled, "no lifecycle event may reconnect or replay a failed reporter");
+	Ok(())
+}
+
+#[test]
+fn missing_service_disables_reporter_without_blocking_input_or_lifecycle() -> Result<()> {
+	let fixture = Fixture::new()?;
+	let mut ime = Ime {
+		enabled: true,
+		running: true,
+		focused: false,
+		suspended: false,
+		state: None,
+		transport: Some(Transport::Direct(fixture.root.join("missing"))),
+		connection: None,
+	};
+	ime.focus_in(false)?;
+	assert_disabled(&mut ime)?;
+	// A subsequently available socket cannot revive the reporter in this process.
+	let service = UnixListener::bind(fixture.root.join("missing"))?;
+	service.set_nonblocking(true)?;
+	ime.resume()?;
+	ime.input(false)?;
+	assert_disabled(&mut ime)?;
+	assert_eq!(service.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+	Ok(())
 }
 
 fn receive(peer: &mut BufReader<UnixStream>, op: &str, state: Option<&str>) {
@@ -18,11 +89,18 @@ fn receive(peer: &mut BufReader<UnixStream>, op: &str, state: Option<&str>) {
 	let request: Value = serde_json::from_str(&frame).unwrap();
 	assert_eq!(request["op"], op);
 	assert_eq!(request.get("state").and_then(Value::as_str), state);
-	if op == "activate" { assert_eq!(request["policy"], "mode"); }
+	if op == "activate" {
+		assert_eq!(request["policy"], "mode");
+	}
 }
 
 fn acknowledge(peer: &mut BufReader<UnixStream>, generation: u64, scope: &str) {
-	writeln!(peer.get_mut(), "{}", json!({ "ok": true, "generation": generation, "session": "test-lease", "scope": scope })).unwrap();
+	writeln!(
+		peer.get_mut(),
+		"{}",
+		json!({ "ok": true, "generation": generation, "session": "test-lease", "scope": scope })
+	)
+	.unwrap();
 }
 
 #[test]
@@ -131,6 +209,7 @@ fn rejected_malformed_or_incomplete_ack_revokes_protection_without_retry() -> Re
 	oversized.push(b'\n');
 	for reply in [
 		b"{\"ok\":false,\"generation\":2,\"error\":\"BACKEND_UNAVAILABLE\"}\n".as_slice(),
+		b"{\"ok\":false,\"generation\":2,\"error\":\"FOCUS_UNVERIFIED\"}\n".as_slice(),
 		b"{\"ok\":true,\"generation\":3}\n".as_slice(),
 		b"{\"ok\":true,\"generation\":1,\"session\":\"test-lease\"}\n".as_slice(),
 		b"{\"ok\":true,\"generation\":1,\"session\":\"test-lease\",\"scope\":\"recorded\"}\n".as_slice(),
@@ -150,12 +229,8 @@ fn rejected_malformed_or_incomplete_ack_revokes_protection_without_retry() -> Re
 			receive(&mut peer, "activate", Some("command"));
 			peer.get_mut().write_all(&reply).unwrap();
 		});
-		assert!(ime.input(false).is_err());
-		assert!(!ime.command_ready());
-		assert!(ime.sync(true).is_err());
-		assert!(ime.focus_in(true).is_err());
-		assert!(ime.input(false).is_err());
-		assert!(ime.connection.is_none());
+		ime.input(false)?;
+		assert_disabled(&mut ime)?;
 		service.join().unwrap();
 	}
 	Ok(())
@@ -179,16 +254,15 @@ fn stable_session_and_monotonic_generation_are_required_across_modes() -> Result
 		});
 		ime.focus_in(false)?;
 		assert!(ime.command_ready());
-		assert!(ime.sync(true).is_err());
-		assert!(!ime.command_ready());
-		assert!(ime.input(false).is_err());
+		ime.sync(true)?;
+		assert_disabled(&mut ime)?;
 		service.join().unwrap();
 	}
 	Ok(())
 }
 
 #[test]
-fn failed_suspend_cancels_handoff_and_never_replays_uncertain_source_state() -> Result<()> {
+fn failed_suspend_allows_handoff_and_never_replays_uncertain_source_state() -> Result<()> {
 	for reply in [
 		json!({ "ok": false, "generation": 2, "error": "RESTORE_FAILED" }),
 		json!({ "ok": true, "generation": 2, "session": "test-lease", "scope": "inactive" }),
@@ -203,11 +277,9 @@ fn failed_suspend_cancels_handoff_and_never_replays_uncertain_source_state() -> 
 			writeln!(peer.get_mut(), "{reply}").unwrap();
 		});
 		ime.focus_in(false)?;
-		assert!(ime.stop().is_err());
-		assert!(ime.running, "an unacknowledged release must cancel terminal handoff");
-		assert!(!ime.command_ready());
-		assert!(ime.sync(false).is_err());
-		assert!(ime.resume().is_err());
+		ime.stop()?;
+		assert!(!ime.running, "optional reporter must not cancel terminal handoff");
+		assert_disabled(&mut ime)?;
 		service.join().unwrap();
 	}
 	Ok(())
@@ -222,7 +294,11 @@ struct Fixture {
 impl Fixture {
 	fn new() -> Result<Self> {
 		static NEXT: AtomicU64 = AtomicU64::new(0);
-		let root = std::env::temp_dir().canonicalize()?.join(format!("yi-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+		let root = std::env::temp_dir().canonicalize()?.join(format!(
+			"yi-{}-{}",
+			std::process::id(),
+			NEXT.fetch_add(1, Ordering::Relaxed)
+		));
 		fs::DirBuilder::new().mode(0o700).create(&root)?;
 		let path = root.join("s");
 		let listener = UnixListener::bind(&path)?;
@@ -232,23 +308,37 @@ impl Fixture {
 
 	fn select(&self, identity: (&str, &str)) -> Result<Transport> {
 		let values = [
-			("HERDR_IME_INTENT", OsString::from("1")), ("HERDR_ENV", OsString::from("1")),
-			("HERDR_SOCKET_PATH", self.path.clone().into_os_string()), (identity.0, OsString::from(identity.1)),
+			("HERDR_IME_INTENT", OsString::from("1")),
+			("HERDR_ENV", OsString::from("1")),
+			("HERDR_SOCKET_PATH", self.path.clone().into_os_string()),
+			(identity.0, OsString::from(identity.1)),
 		];
-		Ok(Transport::select(|key| values.iter().find(|(name, _)| *name == key).map(|(_, value)| value.clone()),
-			|| panic!("Herdr must be selected before ordinary SSH/GUI eligibility"))?.unwrap())
+		Ok(
+			Transport::select(
+				|key| values.iter().find(|(name, _)| *name == key).map(|(_, value)| value.clone()),
+				|| panic!("Herdr must be selected before ordinary SSH/GUI eligibility"),
+			)?
+			.unwrap(),
+		)
 	}
 
 	fn reporter(&self, identity: (&str, &str)) -> Result<Ime> {
 		Ok(Ime {
-			enabled: true, running: true, focused: false, suspended: false, state: None, failure: None, last_error: None,
-			transport: Some(self.select(identity)?), connection: None,
+			enabled: true,
+			running: true,
+			focused: false,
+			suspended: false,
+			state: None,
+			transport: Some(self.select(identity)?),
+			connection: None,
 		})
 	}
 }
 
 impl Drop for Fixture {
-	fn drop(&mut self) { fs::remove_dir_all(&self.root).unwrap(); }
+	fn drop(&mut self) {
+		fs::remove_dir_all(&self.root).unwrap();
+	}
 }
 
 fn open(peer: &mut BufReader<UnixStream>, params: Value) {
@@ -278,9 +368,17 @@ fn herdr_pane_and_popup_streams_use_recorded_only_and_preserve_parent_handoff() 
 			open(&mut peer, params);
 			opened(&mut peer);
 			for (generation, (op, state)) in [
-				("activate", Some("command")), ("state", Some("text")), ("suspend", None),
-				("resume", Some("command")), ("blur", None), ("activate", Some("text")), ("close", None),
-			].into_iter().enumerate() {
+				("activate", Some("command")),
+				("state", Some("text")),
+				("suspend", None),
+				("resume", Some("command")),
+				("blur", None),
+				("activate", Some("text")),
+				("close", None),
+			]
+			.into_iter()
+			.enumerate()
+			{
 				receive(&mut peer, op, state);
 				acknowledge(&mut peer, generation as u64 + 1, "recorded");
 			}
@@ -333,8 +431,11 @@ fn child_return_keeps_parent_suspended_until_genuine_input_or_focus() -> Result<
 				wait_return.recv().unwrap();
 				peer.get_mut().set_nonblocking(true).unwrap();
 				let mut byte = [0];
-				assert_eq!(std::io::Read::read(peer.get_mut(), &mut byte).unwrap_err().kind(), std::io::ErrorKind::WouldBlock,
-					"child completion must neither send a mode nor close the retained parent stream");
+				assert_eq!(
+					std::io::Read::read(peer.get_mut(), &mut byte).unwrap_err().kind(),
+					std::io::ErrorKind::WouldBlock,
+					"child completion must neither send a mode nor close the retained parent stream"
+				);
 				peer.get_mut().set_nonblocking(false).unwrap();
 				checked.send(()).unwrap();
 				receive(&mut peer, "resume", Some(if editing { "text" } else { "command" }));
@@ -353,7 +454,11 @@ fn child_return_keeps_parent_suspended_until_genuine_input_or_focus() -> Result<
 			assert!(!ime.command_ready());
 			returned.send(())?;
 			wait_checked.recv_timeout(Duration::from_secs(1))?;
-			if focus { ime.focus_in(editing)?; } else { ime.input(editing)?; }
+			if focus {
+				ime.focus_in(editing)?;
+			} else {
+				ime.input(editing)?;
+			}
 			assert_eq!(ime.command_ready(), !editing);
 			ime.quit()?;
 			service.join().unwrap();
@@ -379,9 +484,8 @@ fn herdr_never_accepts_applied_scope_or_wrong_open_session_generation() -> Resul
 			receive(&mut peer, "activate", Some("command"));
 			writeln!(peer.get_mut(), "{reply}").unwrap();
 		});
-		assert!(ime.focus_in(false).is_err());
-		assert!(!ime.command_ready());
-		assert!(ime.input(true).is_err());
+		ime.focus_in(false)?;
+		assert_disabled(&mut ime)?;
 		service.join().unwrap();
 	}
 	Ok(())
@@ -408,9 +512,8 @@ fn malformed_open_is_refused_before_any_mode_can_be_recorded() -> Result<()> {
 			let mut unexpected = String::new();
 			assert_eq!(peer.read_line(&mut unexpected).unwrap(), 0);
 		});
-		assert!(ime.focus_in(false).is_err());
-		assert!(!ime.command_ready());
-		assert!(ime.sync(true).is_err());
+		ime.focus_in(false)?;
+		assert_disabled(&mut ime)?;
 		service.join().unwrap();
 	}
 	Ok(())
@@ -423,12 +526,27 @@ fn invalid_marker_or_identity_never_falls_back_to_the_host_daemon() -> Result<()
 		vec![("HERDR_IME_INTENT", "")],
 		vec![("HERDR_IME_INTENT", "1")],
 		vec![("HERDR_IME_INTENT", "1"), ("HERDR_ENV", "1")],
-		vec![("HERDR_IME_INTENT", "1"), ("HERDR_ENV", "1"), ("HERDR_PANE_ID", "p"), ("HERDR_IME_POPUP_TERMINAL_ID", "t")],
+		vec![
+			("HERDR_IME_INTENT", "1"),
+			("HERDR_ENV", "1"),
+			("HERDR_PANE_ID", "p"),
+			("HERDR_IME_POPUP_TERMINAL_ID", "t"),
+		],
 		vec![("HERDR_IME_INTENT", "1"), ("HERDR_ENV", "1"), ("HERDR_PANE_ID", "p")],
-		vec![("HERDR_IME_INTENT", "1"), ("HERDR_ENV", "1"), ("HERDR_PANE_ID", "p"), ("HERDR_SOCKET_PATH", "tcp://host:123")],
+		vec![
+			("HERDR_IME_INTENT", "1"),
+			("HERDR_ENV", "1"),
+			("HERDR_PANE_ID", "p"),
+			("HERDR_SOCKET_PATH", "tcp://host:123"),
+		],
 	] {
-		assert!(Transport::select(|key| values.iter().find(|(name, _)| *name == key).map(|(_, value)| OsString::from(value)),
-			|| panic!("invalid marker must never reach ordinary local eligibility")).is_err());
+		assert!(
+			Transport::select(
+				|key| values.iter().find(|(name, _)| *name == key).map(|(_, value)| OsString::from(value)),
+				|| panic!("invalid marker must never reach ordinary local eligibility")
+			)
+			.is_err()
+		);
 	}
 	assert!(Transport::select(|_| None, || false)?.is_none());
 	Ok(())
@@ -446,10 +564,19 @@ fn herdr_refuses_nonprivate_socket_or_ancestor_and_symlink_traversal() -> Result
 	let alias = fixture.root.join("alias");
 	symlink(&fixture.path, &alias)?;
 	let values = [("HERDR_IME_INTENT", "1"), ("HERDR_ENV", "1"), ("HERDR_PANE_ID", "p")];
-	assert!(Transport::select(|key| {
-		if key == "HERDR_SOCKET_PATH" { Some(alias.clone().into_os_string()) }
-		else { values.iter().find(|(name, _)| *name == key).map(|(_, value)| OsString::from(value)) }
-	}, || panic!("Herdr cannot fall back after unsafe socket refusal")).is_err());
+	assert!(
+		Transport::select(
+			|key| {
+				if key == "HERDR_SOCKET_PATH" {
+					Some(alias.clone().into_os_string())
+				} else {
+					values.iter().find(|(name, _)| *name == key).map(|(_, value)| OsString::from(value))
+				}
+			},
+			|| panic!("Herdr cannot fall back after unsafe socket refusal")
+		)
+		.is_err()
+	);
 	Ok(())
 }
 
@@ -465,11 +592,8 @@ fn eof_after_command_ack_does_not_reconnect_or_replay_the_old_mode() -> Result<(
 	});
 	ime.focus_in(false)?;
 	assert!(ime.command_ready());
-	assert!(ime.sync(true).is_err());
-	assert!(!ime.command_ready());
-	assert!(ime.input(false).is_err());
-	assert!(ime.focus_in(false).is_err());
-	assert!(ime.connection.is_none());
+	ime.sync(true)?;
+	assert_disabled(&mut ime)?;
 	service.join().unwrap();
 	Ok(())
 }
@@ -485,9 +609,8 @@ fn same_mode_key_cannot_use_a_cached_ack_after_socket_eof() -> Result<()> {
 	});
 	ime.focus_in(false)?;
 	service.join().unwrap();
-	assert!(ime.input(false).is_err());
-	assert!(!ime.command_ready());
-	assert!(ime.input(true).is_err());
+	ime.input(false)?;
+	assert_disabled(&mut ime)?;
 	Ok(())
 }
 

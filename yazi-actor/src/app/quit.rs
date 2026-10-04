@@ -7,7 +7,11 @@ use yazi_emulator::EMULATOR;
 use yazi_fs::engine::{Engine, local::Local};
 use yazi_macro::succ;
 use yazi_parser::app::QuitForm;
-use yazi_shared::{data::Data, strand::{StrandBuf, StrandLike, ToStrand}, url::UrlBuf};
+use yazi_shared::{
+	data::Data,
+	strand::{StrandBuf, StrandLike, ToStrand},
+	url::UrlBuf,
+};
 use yazi_tui::Raterm;
 
 use crate::{Actor, Ctx};
@@ -24,7 +28,7 @@ impl Actor for Quit {
 		cx.mgr.shutdown();
 		yazi_plugin::shutdown();
 		// Close the service lease before exiting; process::exit skips Drop.
-		let ime_result = cx.ime.quit();
+		cx.ime.quit()?;
 
 		let cwd = cx.mgr.cwd().clone();
 		task::spawn_local(async move {
@@ -37,9 +41,6 @@ impl Actor for Quit {
 			);
 
 			Raterm::stop();
-			if let Err(error) = ime_result {
-				eprintln!("Yazi could not close the IME control session: {error}");
-			}
 			process::exit(opt.code);
 		});
 

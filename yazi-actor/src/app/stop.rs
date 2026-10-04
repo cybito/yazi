@@ -1,10 +1,7 @@
-use std::time::Duration;
-
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use tokio::task;
-use yazi_core::notify::{MessageLevel, MessageOpt};
 use yazi_emulator::EMULATOR;
-use yazi_macro::{act, succ};
+use yazi_macro::succ;
 use yazi_parser::app::StopForm;
 use yazi_scheduler::AppProxy;
 use yazi_shared::data::Data;
@@ -26,19 +23,7 @@ impl Actor for Stop {
 			});
 			succ!();
 		}
-		if let Err(error) = cx.ime.stop() {
-			let message = format!("Cannot release IME control before terminal handoff: {error}");
-			act!(notify:push, cx, MessageOpt {
-				title: "Input method".to_owned(),
-				content: message.clone(),
-				level: MessageLevel::Warn,
-				timeout: Duration::from_secs(8),
-			}).ok();
-			if let Some(replier) = replier {
-				replier.send(Err(anyhow!(message))).ok();
-			}
-			return Err(error);
-		}
+		cx.ime.stop()?;
 
 		cx.active_mut().preview.reset_image();
 

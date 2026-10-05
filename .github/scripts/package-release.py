@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Yazi install artifacts; public interface: check, pack, publish, verify."""
+"""Yazi install artifacts and immutable GitHub Release assets."""
 import argparse
 import hashlib
 import json
@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import filecmp
 import subprocess
 import sys
 import tarfile
@@ -15,12 +16,11 @@ import tomllib
 
 PROJECT = 'yazi'
 SOURCE = 'https://github.com/cybito/yazi.git'
-PACKAGE = 'git.cybit.top/cybit/ias-yazi'
-TYPE = 'application/vnd.cybito.install-package.v1'
-MEDIA = {'release.json': 'application/json', 'SHA256SUMS': 'text/plain'}
 TAG = re.compile(r'v([0-9]+\.[0-9]+\.[0-9]+)-custom\.([1-9][0-9]*)\Z')
 SHA = re.compile(r'[0-9a-f]{40}\Z')
 ROOT = Path(__file__).resolve().parents[2]
+MAX_FILE = 2 * 1024**3
+MAX_ASSETS = 1000
 
 
 def run(*args, cwd=None):
@@ -29,6 +29,10 @@ def run(*args, cwd=None):
 
 def digest(data):
     return hashlib.sha256(data).hexdigest()
+
+def file_digest(path):
+    with open(path, 'rb') as stream:
+        return hashlib.file_digest(stream, 'sha256').hexdigest()
 
 
 def absolute(value):
@@ -41,93 +45,86 @@ def absolute(value):
 def identity(tag, commit, platform):
     if not TAG.fullmatch(tag) or not SHA.fullmatch(commit) or platform not in ('darwin', 'linux'):
         raise ValueError('invalid release identity')
-    return f'{PACKAGE}:{tag}-{platform}-arm64'
+    return tag, platform
 
 
-def oras(*args, config=None, cwd=None):
-    flag = '--to-registry-config' if args[0] == 'cp' else '--registry-config'
-    return run('oras', *args, flag, str(config or os.environ.get('ORAS_REGISTRY_CONFIG', '/dev/null')), cwd=cwd)
+def package_names(tag, platform):
+    package = f'yazi-{tag}-{platform}-arm64.tar.gz'
+    return [package, 'release.json', 'SHA256SUMS']
 
 
-def manifest_bytes(reference, config=None):
-    # Preserve exact bytes: manifest digest covers serialization, not parsed JSON.
-    return subprocess.check_output(['oras', 'manifest', 'fetch', reference, '--registry-config', str(config or os.environ.get('ORAS_REGISTRY_CONFIG', '/dev/null'))])
+def gh_assets(tag):
+    result = json.loads(run('gh', 'release', 'view', tag, '--repo', 'cybito/yazi', '--json', 'assets'))
+    return {asset['name']: asset for asset in result['assets']}
+
+def download_asset(tag, name, destination):
+    subprocess.run(
+        ['gh', 'release', 'download', tag, '--repo', 'cybito/yazi', '--pattern', name, '--dir', str(destination)],
+        check=True,
+    )
 
 
-def verify(reference, output, config=None):
-    if not re.fullmatch(re.escape(PACKAGE) + r'@sha256:[0-9a-f]{64}', reference):
-        raise ValueError('verification requires this package immutable digest')
-    output.mkdir(parents=True, exist_ok=True)
-    if any(output.iterdir()):
-        raise ValueError('verification directory must be empty')
-    raw = manifest_bytes(reference, config)
-    if digest(raw) != reference.rsplit(':', 1)[1]:
-        raise ValueError('manifest digest mismatch')
-    manifest = json.loads(raw)
-    if manifest.get('artifactType') != TYPE:
-        raise ValueError('wrong artifact type')
-    descriptors = manifest.get('layers', [])
-    names = []
-    for layer in descriptors:
-        name = layer.get('annotations', {}).get('org.opencontainers.image.title', '')
-        if not name or Path(name).name != name or name in names:
-            raise ValueError('unsafe or duplicate layer filename')
-        names.append(name)
-    oras('pull', reference, '--output', str(output), config=config)
-    for layer, name in zip(descriptors, names):
-        path = output / name
-        if path.is_symlink() or not path.is_file():
-            raise ValueError('missing regular layer')
-        data = path.read_bytes()
-        if len(data) != layer['size'] or 'sha256:' + digest(data) != layer['digest']:
-            raise ValueError('layer mismatch')
-        expected = MEDIA.get(name, 'application/gzip' if name.endswith('.tar.gz') else None)
-        if expected is None or layer['mediaType'] != expected:
-            raise ValueError('unexpected layer media type')
-    receipt = json.loads((output / 'release.json').read_bytes())
+def asset_name(tag, platform, filename):
+    return f'{tag}-{platform}-{filename}'
+
+
+def verify_directory(directory, tag=None, commit=None, platform=None):
+    directory = Path(directory)
+    receipt = json.loads((directory / 'release.json').read_text())
     fields = {'schema', 'project', 'source_repo', 'source_commit', 'release_tag', 'platform', 'architecture', 'toolchains', 'files'}
     if set(receipt) != fields or receipt['schema'] != 1 or receipt['project'] != PROJECT or receipt['source_repo'] != SOURCE or receipt['architecture'] != 'arm64':
-        raise ValueError('invalid receipt')
+        raise ValueError('invalid release receipt')
     identity(receipt['release_tag'], receipt['source_commit'], receipt['platform'])
+    if tag is not None and (receipt['release_tag'], receipt['source_commit'], receipt['platform']) != (tag, commit, platform):
+        raise ValueError('release identity differs')
     if not isinstance(receipt['toolchains'], dict) or not receipt['toolchains'] or not all(isinstance(v, str) for v in receipt['toolchains'].values()):
         raise ValueError('invalid toolchains')
+    expected = package_names(receipt['release_tag'], receipt['platform'])
+    if set(p.name for p in directory.iterdir()) != set(expected):
+        raise ValueError('unexpected asset files')
+    package = expected[0]
     files = receipt['files']
-    expected_name = f"yazi-{receipt['release_tag']}-{receipt['platform']}-arm64.tar.gz"
-    config_descriptor = manifest['config']
-    config_bytes = subprocess.check_output(['oras', 'blob', 'fetch', '--output', '-', PACKAGE + '@' + config_descriptor['digest'], '--registry-config', str(config or os.environ.get('ORAS_REGISTRY_CONFIG', '/dev/null'))])
-    if len(config_bytes) != config_descriptor['size'] or 'sha256:' + digest(config_bytes) != config_descriptor['digest']:
-        raise ValueError('config descriptor mismatch')
-    if len(files) != 1 or set(files[0]) != {'name', 'sha256', 'size'} or files[0]['name'] != expected_name:
+    if len(files) != 1 or set(files[0]) != {'name', 'sha256', 'size'} or files[0]['name'] != package:
         raise ValueError('invalid payload list')
-    if set(names) != {'release.json', 'SHA256SUMS', expected_name} or set(p.name for p in output.iterdir()) != set(names):
-        raise ValueError('unexpected payload files')
-    for file in files:
-        data = (output / file['name']).read_bytes()
-        if digest(data) != file['sha256'] or len(data) != file['size']:
+    for record in files:
+        path = directory / record['name']
+        if file_digest(path) != record['sha256'] or path.stat().st_size != record['size']:
             raise ValueError('receipt hash mismatch')
-    checks = ''.join(f'{digest((output / n).read_bytes())}  {n}\n' for n in sorted([expected_name, 'release.json']))
-    if (output / 'SHA256SUMS').read_text() != checks:
+    checks = ''.join(f'{file_digest(directory / name)}  {name}\n' for name in sorted((package, 'release.json')))
+    if (directory / 'SHA256SUMS').read_text() != checks:
         raise ValueError('checksum file mismatch')
-    annotations = manifest.get('annotations', {})
-    for key, value in {'source': SOURCE, 'revision': receipt['source_commit'], 'version': receipt['release_tag']}.items():
-        if annotations.get('org.opencontainers.image.' + key) != value:
-            raise ValueError('manifest identity mismatch')
     return receipt
 
 
-def check(tag, commit, platform, output, config=None):
-    reference = identity(tag, commit, platform)
-    result = subprocess.run(['oras', 'manifest', 'fetch', '--descriptor', reference, '--registry-config', str(config or os.environ.get('ORAS_REGISTRY_CONFIG', '/dev/null'))], capture_output=True, text=True)
-    if result.returncode:
-        if re.search(r'\b(?:MANIFEST_UNKNOWN|NAME_UNKNOWN|manifest_unknown|name_unknown)\b', result.stderr):
-            return {'exists': False}
-        raise RuntimeError(result.stderr)
-    descriptor = json.loads(result.stdout)
-    immutable = PACKAGE + '@' + descriptor['digest']
-    receipt = verify(immutable, output, config)
-    if (receipt['source_commit'], receipt['release_tag'], receipt['platform']) != (commit, tag, platform):
-        raise ValueError('existing release identity differs; refusing overwrite')
-    return {'exists': True, 'reference': immutable}
+
+def check(tag, commit, platform, output):
+    identity(tag, commit, platform)
+    assets = gh_assets(tag)
+    expected = package_names(tag, platform)
+    prefix = f'{tag}-{platform}-'
+    expected_assets = {asset_name(tag, platform, original) for original in expected}
+    unexpected = [name for name in assets if name.startswith(prefix) and name not in expected_assets]
+    if unexpected:
+        raise ValueError(f'unexpected colliding platform assets: {unexpected}')
+    available = [asset_name(tag, platform, name) for name in expected if asset_name(tag, platform, name) in assets]
+    if not available:
+        return {'exists': False}
+    output.mkdir(parents=True, exist_ok=True)
+    if any(output.iterdir()):
+        raise ValueError('check output directory must be empty')
+    with tempfile.TemporaryDirectory() as temp:
+        downloaded = Path(temp)
+        for name in available:
+            download_asset(tag, name, downloaded)
+            original = name[len(tag + '-' + platform + '-'):]
+            shutil.move(downloaded / name, output / original)
+    # Partial platform sets are valid; only reuse when all package bytes exist
+    # and form a coherent, receipt-verified set.
+    if len(available) != len(expected):
+        shutil.rmtree(output)
+        return {'exists': False}
+    verify_directory(output, tag, commit, platform)
+    return {'exists': True, 'assets': available}
 
 
 INSTALL = '''#!/bin/sh
@@ -139,24 +136,17 @@ if [ "$#" -gt 0 ]; then
 fi
 case "$prefix" in /*) ;; *) echo 'prefix must be absolute' >&2; exit 2;; esac
 root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-# Preflight the entire tree before copying; refuse different files and symlinks.
 for tree in bin share; do
   [ ! -L "$prefix/$tree" ] || exit 1
   find "$root/$tree" -type f | while IFS= read -r src; do
-    rel=${src#"$root/"}; dst=$prefix/$rel
-    parent=$(dirname "$dst")
+    rel=${src#"$root/"}; dst=$prefix/$rel; parent=$(dirname "$dst")
     while [ "$parent" != / ]; do [ ! -L "$parent" ] || exit 1; parent=$(dirname "$parent"); done
-    if [ -e "$dst" ] || [ -L "$dst" ]; then
-      [ -f "$dst" ] && [ ! -L "$dst" ] && cmp -s "$src" "$dst" || { echo "refusing overwrite: $dst" >&2; exit 1; }
-    fi
+    if [ -e "$dst" ] || [ -L "$dst" ]; then [ -f "$dst" ] && [ ! -L "$dst" ] && cmp -s "$src" "$dst" || { echo "refusing overwrite: $dst" >&2; exit 1; }; fi
   done
- done
+done
 for tree in bin share; do
-  find "$root/$tree" -type f | while IFS= read -r src; do
-    rel=${src#"$root/"}; dst=$prefix/$rel
-    if [ ! -e "$dst" ]; then mkdir -p "$(dirname "$dst")"; cp -p "$src" "$dst"; fi
-  done
- done
+  find "$root/$tree" -type f | while IFS= read -r src; do rel=${src#"$root/"}; dst=$prefix/$rel; if [ ! -e "$dst" ]; then mkdir -p "$(dirname "$dst")"; cp -p "$src" "$dst"; fi; done
+done
 '''
 
 
@@ -184,11 +174,10 @@ def pack(args):
         name = f'yazi-{args.tag}-{args.platform}-arm64.tar.gz'
         with tarfile.open(output / name, 'w:gz') as archive:
             archive.add(tree, arcname='yazi')
-    data = (output / name).read_bytes()
-    receipt = dict(schema=1, project=PROJECT, source_repo=SOURCE, source_commit=args.commit, release_tag=args.tag, platform=args.platform, architecture='arm64', toolchains=json.loads((source / 'toolchains.json').read_text()), files=[dict(name=name, sha256=digest(data), size=len(data))])
+    archive = output / name
+    receipt = dict(schema=1, project=PROJECT, source_repo=SOURCE, source_commit=args.commit, release_tag=args.tag, platform=args.platform, architecture='arm64', toolchains=json.loads((source / 'toolchains.json').read_text()), files=[dict(name=name, sha256=file_digest(archive), size=archive.stat().st_size)])
     (output / 'release.json').write_text(json.dumps(receipt, sort_keys=True, indent=2) + '\n')
-    (output / 'SHA256SUMS').write_text(''.join(f'{digest((output / n).read_bytes())}  {n}\n' for n in sorted([name, 'release.json'])))
-    # Exercise the shipped installer twice, never the real HOME.
+    (output / 'SHA256SUMS').write_text(''.join(f'{file_digest(output / n)}  {n}\n' for n in sorted([name, 'release.json'])))
     with tempfile.TemporaryDirectory() as temp:
         subprocess.run(['tar', '-xzf', str(output / name), '-C', temp], check=True)
         prefix = str(Path(temp) / 'prefix')
@@ -200,45 +189,58 @@ def pack(args):
 
 
 def publish(args):
-    directory, config = absolute(args.directory), absolute(args.registry_config)
-    receipt = json.loads((directory / 'release.json').read_text())
-    reference = identity(receipt['release_tag'], receipt['source_commit'], receipt['platform'])
+    directory = absolute(args.directory)
+    receipt = verify_directory(directory)
+    tag, platform = receipt['release_tag'], receipt['platform']
+    assets = gh_assets(tag)
+    expected = package_names(tag, platform)
+    platform_assets = [asset_name(tag, platform, name) for name in expected]
+    prefix = f'{tag}-{platform}-'
+    unexpected = [name for name in assets if name.startswith(prefix) and name not in set(platform_assets)]
+    if unexpected:
+        raise ValueError(f'unexpected colliding platform assets: {unexpected}')
+    if len(assets) > MAX_ASSETS:
+        raise ValueError('release already exceeds asset limit')
     with tempfile.TemporaryDirectory() as temp:
-        existing = check(receipt['release_tag'], receipt['source_commit'], receipt['platform'], Path(temp) / 'existing', config)
-        if existing['exists']:
-            for name in [f['name'] for f in receipt['files']] + ['release.json', 'SHA256SUMS']:
-                if (directory / name).read_bytes() != (Path(temp) / 'existing' / name).read_bytes():
-                    raise ValueError('existing tag bytes differ')
-            return dict(reference=existing['reference'], digest=existing['reference'].split('@')[1])
-        layout = str(Path(temp) / 'layout')
-        local = layout + ':release'
-        from datetime import datetime, timezone
-        timestamp = int(run('git', 'show', '-s', '--format=%ct', receipt['source_commit'], cwd=ROOT))
-        created = datetime.fromtimestamp(timestamp, timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
-        args_list = ['push', '--oci-layout', local, '--artifact-type', TYPE]
-        for key, value in {'source': SOURCE, 'revision': receipt['source_commit'], 'version': receipt['release_tag'], 'created': created}.items():
-            args_list += ['--annotation', f'org.opencontainers.image.{key}={value}']
-        for name in [f['name'] for f in receipt['files']] + ['release.json', 'SHA256SUMS']:
-            args_list.append(name + ':' + MEDIA.get(name, 'application/gzip'))
-        oras(*args_list, config=config, cwd=directory)
-        index = json.loads((Path(layout) / 'index.json').read_text())
-        dgst = index['manifests'][0]['digest']
-        immutable = PACKAGE + '@' + dgst
-        oras('cp', '--from-oci-layout', local, reference, config=config)
-        verified = verify(immutable, Path(temp) / 'pulled', config)
-        if verified != receipt:
-            raise ValueError('published receipt differs')
-        if json.loads(oras('manifest', 'fetch', '--descriptor', reference, config=config))['digest'] != dgst:
-            raise ValueError('published tag digest differs')
-        return dict(reference=immutable, digest=dgst)
+        existing_dir = Path(temp)
+        existing_names = [name for name in platform_assets if name in assets]
+        for remote_name in existing_names:
+            asset = assets[remote_name]
+            if asset['size'] >= MAX_FILE:
+                raise ValueError('existing release asset exceeds 2 GiB')
+            download_asset(tag, remote_name, existing_dir)
+            original = remote_name[len(tag + '-' + platform + '-'):]
+            if not filecmp.cmp(existing_dir / remote_name, directory / original, shallow=False):
+                raise ValueError(f'refusing to overwrite differing asset {remote_name}')
+        missing = [name for name in platform_assets if name not in assets]
+        if len(assets) + len(missing) > MAX_ASSETS:
+            raise ValueError('upload would exceed 1000 release assets')
+        for remote_name in missing:
+            original = remote_name[len(prefix):]
+            if (directory / original).stat().st_size >= MAX_FILE:
+                raise ValueError(f'asset reaches GitHub 2 GiB limit: {remote_name}')
+        if missing:
+            staging = Path(temp) / 'upload'
+            staging.mkdir()
+            staged = []
+            for remote_name in missing:
+                original = remote_name[len(prefix):]
+                target = staging / remote_name
+                shutil.copyfile(directory / original, target)
+                staged.append(str(target))
+            subprocess.run(['gh', 'release', 'upload', tag, '--repo', 'cybito/yazi', *staged], check=True)
+        result = check(tag, receipt['source_commit'], platform, Path(temp) / 'verified')
+        if not result['exists']:
+            raise ValueError('uploaded assets failed readback validation')
+        return {'assets': result['assets']}
 
 
 def validate_event():
     event = json.loads(Path(os.environ['GITHUB_EVENT_PATH']).read_text())
     release = event['release']
     tag = release['tag_name']
-    if os.environ['GITHUB_REPOSITORY'] != 'cybito/yazi' or release['draft'] or not TAG.fullmatch(tag) or release['assets']:
-        raise ValueError('invalid release event or nonempty assets')
+    if os.environ['GITHUB_REPOSITORY'] != 'cybito/yazi' or release['draft'] or not TAG.fullmatch(tag):
+        raise ValueError('invalid release event')
     commit = run('git', 'rev-parse', '--verify', 'refs/tags/' + tag + '^{commit}', cwd=ROOT)
     if run('git', 'rev-parse', 'HEAD', cwd=ROOT) != commit:
         raise ValueError('validation checkout differs from dereferenced release tag')
@@ -257,21 +259,17 @@ def validate_event():
 def summarize():
     event = json.loads(Path(os.environ['GITHUB_EVENT_PATH']).read_text())
     release = event['release']
-    if release['assets']:
-        raise ValueError('GitHub assets must remain empty')
     tag, commit = os.environ['RELEASE_TAG'], os.environ['SOURCE_SHA']
-    references = []
+    links = []
     with tempfile.TemporaryDirectory() as temp:
         for platform in ('darwin', 'linux'):
             checked = check(tag, commit, platform, Path(temp) / platform)
             if not checked['exists']:
-                raise ValueError('missing platform')
-            references.append((platform, checked['reference']))
+                raise ValueError('missing or invalid platform assets')
+            links.append((platform, checked['assets']))
     start, end = '<!-- custom-builds:start -->', '<!-- custom-builds:end -->'
-    block = start + f'\nSource: `{SOURCE}` at `{commit}`; release `{tag}`.\n\n[Forgejo package](https://git.cybit.top/cybit/-/packages/container/ias-yazi)\n\n' + '\n'.join(f'### {p} ARM64\n```sh\noras pull {r}\n```\n' for p, r in references) + end
+    block = start + f'\nSource: `{SOURCE}` at `{commit}`; release `{tag}`.\n\n' + '\n'.join(f'### {platform} ARM64\n' + '\n'.join(f'- [{name}](https://github.com/cybito/yazi/releases/download/{tag}/{name})' for name in names) for platform, names in links) + '\n' + end
     current = json.loads(run('gh', 'api', f'repos/cybito/yazi/releases/{release["id"]}'))
-    if current['assets']:
-        raise ValueError('GitHub assets must remain empty')
     body = current.get('body') or ''
     if start in body or end in body:
         if body.count(start) != 1 or body.count(end) != 1 or body.index(start) > body.index(end):
@@ -280,11 +278,10 @@ def summarize():
     else:
         body += '\n\n' + block
     subprocess.run(['gh', 'api', '--method', 'PATCH', f'repos/cybito/yazi/releases/{release["id"]}', '--input', '-'], input=json.dumps({'body': body}), text=True, check=True, stdout=subprocess.DEVNULL)
-    return {'references': dict(references)}
+    return {'assets': dict(links)}
 
 
 def regression_tests():
-    """Real git ancestry and malicious event regression fixtures."""
     global ROOT
     from unittest.mock import patch
     original = ROOT
@@ -294,69 +291,79 @@ def regression_tests():
         run('git', 'config', 'user.email', 'fixture@example.invalid', cwd=ROOT)
         run('git', 'config', 'user.name', 'fixture', cwd=ROOT)
         for path in ('.github/workflows/custom-release.yml', '.github/scripts/custom-release.sh', '.github/scripts/package-release.py'):
-            destination = ROOT / path
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            destination.write_text('fixture\n')
+            destination = ROOT / path; destination.parent.mkdir(parents=True, exist_ok=True); destination.write_text('fixture\n')
         (ROOT / 'Cargo.toml').write_text('[workspace.package]\nversion="26.9.1"\n')
-        run('git', 'add', '.', cwd=ROOT)
-        run('git', 'commit', '-qm', 'custom fixture', cwd=ROOT)
-        commit = run('git', 'rev-parse', 'HEAD', cwd=ROOT)
-        run('git', 'update-ref', 'refs/remotes/origin/custom', commit, cwd=ROOT)
-        run('git', 'tag', 'v26.9.1-custom.1', cwd=ROOT)
+        run('git', 'add', '.', cwd=ROOT); run('git', 'commit', '-qm', 'custom fixture', cwd=ROOT)
+        commit = run('git', 'rev-parse', 'HEAD', cwd=ROOT); run('git', 'update-ref', 'refs/remotes/origin/custom', commit, cwd=ROOT); run('git', 'tag', 'v26.9.1-custom.1', cwd=ROOT)
         event = ROOT / 'event.json'
-        def write_event(tag):
-            event.write_text(json.dumps({'release': {'tag_name': tag, 'draft': False, 'assets': []}}))
+        def write_event(tag): event.write_text(json.dumps({'release': {'tag_name': tag, 'draft': False, 'assets': []}}))
         with patch.dict(os.environ, GITHUB_EVENT_PATH=str(event), GITHUB_REPOSITORY='cybito/yazi', GITHUB_OUTPUT=str(ROOT / 'output')):
-            write_event('v26.9.1-custom.1')
-            assert validate_event()['commit'] == commit
-            run('git', 'checkout', '--orphan', 'upstream-only', cwd=ROOT)
-            run('git', 'commit', '-qm', 'unrelated upstream', cwd=ROOT)
-            run('git', 'tag', 'v26.9.1-custom.2', cwd=ROOT)
+            write_event('v26.9.1-custom.1'); assert validate_event()['commit'] == commit
+            run('git', 'checkout', '--orphan', 'upstream-only', cwd=ROOT); run('git', 'commit', '-qm', 'unrelated upstream', cwd=ROOT); run('git', 'tag', 'v26.9.1-custom.2', cwd=ROOT)
             for tag in ('v26.9.1-custom.2', 'v26.9.1', 'v26.9.1-custom.1;touch PWNED'):
                 write_event(tag)
-                try:
-                    validate_event()
-                except (ValueError, subprocess.CalledProcessError):
-                    pass
-                else:
-                    raise AssertionError('invalid event accepted')
+                try: validate_event()
+                except (ValueError, subprocess.CalledProcessError): pass
+                else: raise AssertionError('invalid event accepted')
             assert not (ROOT / 'PWNED').exists()
-        for message in ('unauthorized: authentication required', 'connection timed out'):
-            with patch('subprocess.run', return_value=subprocess.CompletedProcess([], 1, '', message)):
-                try:
-                    check('v26.9.1-custom.1', commit, 'linux', ROOT / 'missing')
-                except RuntimeError:
-                    pass
-                else:
-                    raise AssertionError('registry error treated as missing')
-        with patch('subprocess.run', return_value=subprocess.CompletedProcess([], 1, '', 'MANIFEST_UNKNOWN')):
-            assert check('v26.9.1-custom.1', commit, 'linux', ROOT / 'missing') == {'exists': False}
-        with patch('subprocess.run', return_value=subprocess.CompletedProcess([], 0, json.dumps({'digest': 'sha256:' + 'a' * 64}), '')), patch(__name__ + '.verify', return_value={'source_commit': 'b' * 40, 'release_tag': 'v26.9.1-custom.1', 'platform': 'linux'}):
-            try:
-                check('v26.9.1-custom.1', commit, 'linux', ROOT / 'wrong')
-            except ValueError:
-                pass
-            else:
-                raise AssertionError('wrong receipt reused')
+        fixture = ROOT / 'asset'; fixture.mkdir()
+        data = b'payload'; (fixture / 'yazi-v26.9.1-custom.1-linux-arm64.tar.gz').write_bytes(data)
+        receipt = dict(schema=1, project=PROJECT, source_repo=SOURCE, source_commit=commit, release_tag='v26.9.1-custom.1', platform='linux', architecture='arm64', toolchains={'rustc': 'rustc 1.97.1'}, files=[dict(name='yazi-v26.9.1-custom.1-linux-arm64.tar.gz', sha256=digest(data), size=len(data))])
+        (fixture / 'release.json').write_text(json.dumps(receipt)); (fixture / 'SHA256SUMS').write_text(''.join(f'{digest((fixture / n).read_bytes())}  {n}\n' for n in sorted(['release.json', receipt['files'][0]['name']])))
+        assert verify_directory(fixture, receipt['release_tag'], commit, 'linux') == receipt
+        (fixture / 'SHA256SUMS').write_text('bad')
+        try: verify_directory(fixture)
+        except ValueError: pass
+        else: raise AssertionError('bad checksum accepted')
+        (fixture / 'SHA256SUMS').write_text(''.join(f'{digest((fixture / n).read_bytes())}  {n}\n' for n in sorted(['release.json', receipt['files'][0]['name']])))
+        assets = {asset_name(receipt['release_tag'], 'linux', n): {'size': 1} for n in package_names(receipt['release_tag'], 'linux')}
+        unexpected = dict(assets)
+        unexpected[asset_name(receipt['release_tag'], 'linux', 'extra.tar.gz')] = {'size': 1}
+        with patch(__name__ + '.gh_assets', return_value=unexpected):
+            try: check(receipt['release_tag'], commit, 'linux', ROOT / 'collision')
+            except ValueError: pass
+            else: raise AssertionError('unexpected platform asset accepted')
+        with patch(__name__ + '.gh_assets', return_value=assets), patch(__name__ + '.download_asset', side_effect=lambda tag, name, dst: shutil.copy2(fixture / name[len(tag + '-linux-'):], dst / name)):
+            result = check(receipt['release_tag'], commit, 'linux', ROOT / 'download')
+            assert result['exists'] and len(result['assets']) == 3
+        bad_asset = {asset_name(receipt['release_tag'], 'linux', package_names(receipt['release_tag'], 'linux')[0]): {'size': len(data) + 1}}
+        with patch(__name__ + '.gh_assets', return_value=bad_asset), patch(__name__ + '.download_asset', side_effect=lambda tag, name, dst: (dst / name).write_bytes(b'different')):
+            try: publish(argparse.Namespace(directory=str(fixture)))
+            except ValueError: pass
+            else: raise AssertionError('mismatching partial asset accepted')
+        partial = dict(list(assets.items())[:1])
+        with patch(__name__ + '.gh_assets', return_value=partial), patch(__name__ + '.download_asset', side_effect=lambda tag, name, dst: shutil.copy2(fixture / name[len(tag + '-linux-'):], dst / name)):
+            result = check(receipt['release_tag'], commit, 'linux', ROOT / 'partial')
+            assert result == {'exists': False}
+        partial_assets = {asset_name(receipt['release_tag'], 'linux', package_names(receipt['release_tag'], 'linux')[0]): {'size': len(data)}}
+        uploaded = []
+        def upload(command, **kwargs):
+            uploaded.append(command)
+            for path in command[command.index('--repo') + 2:]:
+                if path == '--clobber':
+                    raise AssertionError('release upload must not clobber')
+                if path.startswith('/'):
+                    name = Path(path).name
+                    partial_assets[name] = {'size': Path(path).stat().st_size}
+            return subprocess.CompletedProcess(command, 0)
+        with patch(__name__ + '.gh_assets', side_effect=lambda tag: dict(partial_assets)), patch(__name__ + '.download_asset', side_effect=lambda tag, name, dst: shutil.copy2(fixture / name[len(tag + '-linux-'):], dst / name)), patch('subprocess.run', side_effect=upload):
+            published = publish(argparse.Namespace(directory=str(fixture)))
+        assert len(published['assets']) == 3
+        assert len(uploaded) == 1 and 'upload' in uploaded[0] and '--clobber' not in uploaded[0]
     ROOT = original
     return {'regressions': 'passed'}
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    sub = parser.add_subparsers(dest='command', required=True)
+    parser = argparse.ArgumentParser(); sub = parser.add_subparsers(dest='command', required=True)
     for command in ('check', 'pack'):
         p = sub.add_parser(command)
-        for arg in ('tag', 'commit', 'platform', 'output-dir'):
-            p.add_argument('--' + arg, required=True)
-        if command == 'pack':
-            p.add_argument('--input-dir', required=True)
-    p = sub.add_parser('verify'); p.add_argument('--reference', required=True); p.add_argument('--output-dir', required=True)
-    p = sub.add_parser('publish'); p.add_argument('--directory', required=True); p.add_argument('--registry-config', required=True)
+        for arg in ('tag', 'commit', 'platform', 'output-dir'): p.add_argument('--' + arg, required=True)
+        if command == 'pack': p.add_argument('--input-dir', required=True)
+    p = sub.add_parser('publish'); p.add_argument('--directory', required=True)
     sub.add_parser('validate-event'); sub.add_parser('summarize'); sub.add_parser('self-test')
     args = parser.parse_args()
     if args.command == 'check': result = check(args.tag, args.commit, args.platform, absolute(args.output_dir))
-    elif args.command == 'verify': result = verify(args.reference, absolute(args.output_dir))
     elif args.command == 'pack': result = pack(args)
     elif args.command == 'publish': result = publish(args)
     elif args.command == 'validate-event': result = validate_event()
@@ -365,8 +372,6 @@ def main():
     print(json.dumps(result))
 
 if __name__ == '__main__':
-    try:
-        main()
+    try: main()
     except (ValueError, RuntimeError, OSError, subprocess.CalledProcessError, KeyError) as error:
-        print(str(error), file=sys.stderr)
-        sys.exit(1)
+        print(str(error), file=sys.stderr); sys.exit(1)

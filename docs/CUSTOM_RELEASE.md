@@ -7,7 +7,7 @@
 
 ## Automated custom releases
 
-Only publishing a GitHub Release in `cybito/yazi` triggers `custom-release.yml`; ordinary pushes, tag pushes and pull requests do not publish. Tags use `v<workspace version>-custom.<positive integer>`; this migration's first asset-bearing release uses `v26.9.1-custom.2`, while existing tags/releases remain unchanged. The tag's dereferenced commit must be an ancestor of `origin/custom`, and contain the release workflow and scripts.
+Only publishing a GitHub Release in `cybito/yazi` triggers `custom-release.yml`; ordinary pushes, tag pushes and pull requests do not publish. Tags use `v<workspace version>-custom.<positive integer>`; this migration's first asset-bearing release uses `v26.9.1-custom.3`, while existing tags/releases remain unchanged. The tag's dereferenced commit must be an ancestor of `origin/custom`, and contain the release workflow and scripts.
 
 The workflow checks out that exact SHA for both `macos-26` ARM64 and `ubuntu-24.04-arm` ARM64. Rust is fixed at **1.97.1**, with matching `RUSTC` and `RUSTDOC`; `YAZI_GEN_COMPLETIONS=1` builds `yazi-fm` and `yazi-cli` with `--locked --release`. It never invokes Debian packaging or upstream publishing workflows. Both `yazi` and `ya` must report the workspace base version, source SHA's first eight characters, `Debug: false`, native triple, and Rust 1.97.1. The custom tag belongs to `release.json`, not a rewritten native version. Both programs' completions are shipped.
 
@@ -20,7 +20,7 @@ Each platform package contains `yazi-<tag>-<platform>-arm64.tar.gz`, `release.js
 Managed Release notes link every file. For manual download and validation:
 
 ```sh
-tag=v26.9.1-custom.2
+tag=v26.9.1-custom.3
 platform=darwin # use linux on Omarchy ARM64
 prefix="$tag-$platform-"
 mkdir -p /absolute/path/to/download

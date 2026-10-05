@@ -179,10 +179,11 @@ def pack(args):
     (output / 'release.json').write_text(json.dumps(receipt, sort_keys=True, indent=2) + '\n')
     (output / 'SHA256SUMS').write_text(''.join(f'{file_digest(output / n)}  {n}\n' for n in sorted([name, 'release.json'])))
     with tempfile.TemporaryDirectory() as temp:
-        subprocess.run(['tar', '-xzf', str(output / name), '-C', temp], check=True)
-        prefix = str(Path(temp) / 'prefix')
+        temp_root = Path(temp).resolve()
+        subprocess.run(['tar', '-xzf', str(output / name), '-C', str(temp_root)], check=True)
+        prefix = str(temp_root / 'prefix')
         for _ in range(2):
-            subprocess.run(['sh', str(Path(temp) / 'yazi/install.sh'), '--prefix', prefix], check=True)
+            subprocess.run(['sh', str(temp_root / 'yazi/install.sh'), '--prefix', prefix], check=True)
         for binary in ('yazi', 'ya'):
             subprocess.run([prefix + '/bin/' + binary, '--version'], check=True, stdout=sys.stderr)
     return {'directory': str(output)}

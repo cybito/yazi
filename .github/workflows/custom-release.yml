@@ -1,0 +1,138 @@
+name: Custom release
+on:
+  release:
+    types: [published]
+permissions:
+  contents: read
+concurrency:
+  group: custom-release-${{ github.repository }}-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+jobs:
+  validate:
+    if: github.repository == 'cybito/yazi'
+    runs-on: ubuntu-24.04-arm
+    outputs:
+      commit: ${{ steps.validate.outputs.commit }}
+      tag: ${{ steps.validate.outputs.tag }}
+      version: ${{ steps.validate.outputs.version }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Fetch custom ancestry
+        run: git fetch --no-tags origin refs/heads/custom:refs/remotes/origin/custom
+      - id: validate
+        name: Validate event and dereferenced source
+        run: python3 .github/scripts/package-release.py validate-event
+      - name: Exercise event and registry boundary regressions
+        run: python3 .github/scripts/package-release.py self-test
+  build:
+    needs: validate
+    environment: forgejo-registry
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: darwin
+            runner: macos-26
+          - platform: linux
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    concurrency:
+      group: custom-package-${{ github.repository }}-${{ needs.validate.outputs.tag }}-${{ matrix.platform }}
+      cancel-in-progress: false
+    env:
+      RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+      SOURCE_SHA: ${{ needs.validate.outputs.commit }}
+      PLATFORM: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install checksum verified ORAS 1.3.3
+        env:
+          ORAS_REGISTRY_CONFIG: ${{ runner.temp }}/anonymous-registry.json
+        run: |
+          umask 077
+          printf '{"auths":{}}\n' > "$ORAS_REGISTRY_CONFIG"
+          bash .github/scripts/custom-release.sh tools
+      - id: existing
+        env:
+          ORAS_REGISTRY_CONFIG: ${{ runner.temp }}/anonymous-registry.json
+        name: Verify existing immutable package before building
+        run: |
+          python3 .github/scripts/package-release.py check --tag "$RELEASE_TAG" --commit "$SOURCE_SHA" --platform "$PLATFORM" --output-dir "$RUNNER_TEMP/existing" > "$RUNNER_TEMP/check.json"
+          python3 - <<'PY'
+          import json, os
+          result = json.load(open(os.environ['RUNNER_TEMP'] + '/check.json'))
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write('exists=' + str(result['exists']).lower() + '\n')
+          if result['exists']:
+              with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as out:
+                  out.write('Reused verified package: `' + result['reference'] + '`\n')
+          PY
+      - name: Build and smoke both native binaries with Rust 1.97.1
+        if: steps.existing.outputs.exists == 'false'
+        run: bash .github/scripts/custom-release.sh build "$PLATFORM" "$RELEASE_TAG" "$SOURCE_SHA" "$RUNNER_TEMP/build"
+      - name: Package completions and exercise isolated idempotent installer
+        if: steps.existing.outputs.exists == 'false'
+        run: python3 .github/scripts/package-release.py pack --tag "$RELEASE_TAG" --commit "$SOURCE_SHA" --platform "$PLATFORM" --input-dir "$RUNNER_TEMP/build" --output-dir "$RUNNER_TEMP/package"
+      - name: Publish and pull back immutable OCI package
+        if: steps.existing.outputs.exists == 'false'
+        env:
+          FORGEJO_REGISTRY_TOKEN: ${{ secrets.FORGEJO_REGISTRY_TOKEN }}
+        run: |
+          set +x
+          set -euo pipefail
+          umask 077
+          mkdir -p "$RUNNER_TEMP/forgejo-auth"
+          chmod 700 "$RUNNER_TEMP/forgejo-auth"
+          config="$RUNNER_TEMP/forgejo-auth/registry-auth.json"
+          trap 'rm -f "$config"; unset FORGEJO_REGISTRY_TOKEN' EXIT
+          test -n "$FORGEJO_REGISTRY_TOKEN"
+          printf '%s' "$FORGEJO_REGISTRY_TOKEN" | oras login git.cybit.top --username cybit --password-stdin --registry-config "$config"
+          chmod 600 "$config"
+          unset FORGEJO_REGISTRY_TOKEN
+          python3 .github/scripts/package-release.py publish --directory "$RUNNER_TEMP/package" --registry-config "$config" > "$RUNNER_TEMP/published.json"
+          python3 - <<'PY'
+          import json, os
+          result = json.load(open(os.environ['RUNNER_TEMP'] + '/published.json'))
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as out:
+              out.write('Published and verified: `' + result['reference'] + '`\n')
+          PY
+      - name: Remove job registry credentials
+        if: always()
+        env:
+          ORAS_REGISTRY_CONFIG: ${{ runner.temp }}/anonymous-registry.json
+        run: rm -f "$RUNNER_TEMP/forgejo-auth/registry-auth.json" "$ORAS_REGISTRY_CONFIG"
+  summarize:
+    needs: [validate, build]
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+      SOURCE_SHA: ${{ needs.validate.outputs.commit }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install checksum verified ORAS 1.3.3
+        env:
+          ORAS_REGISTRY_CONFIG: ${{ runner.temp }}/anonymous-registry.json
+        run: |
+          umask 077
+          printf '{"auths":{}}\n' > "$ORAS_REGISTRY_CONFIG"
+          bash .github/scripts/custom-release.sh tools
+      - name: Verify both public packages and preserve user release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ORAS_REGISTRY_CONFIG: ${{ runner.temp }}/anonymous-registry.json
+        run: python3 .github/scripts/package-release.py summarize

@@ -199,10 +199,16 @@ impl Ime {
 		Ok(())
 	}
 
-	/// Terminal/UI return is not evidence of foreground input or focus.
-	pub fn resume(&mut self) -> Result<()> {
+	/// The caller has restored its terminal; report its current mode before input resumes.
+	/// This is a fresh claim, subject to the transport's foreground arbitration.
+	pub fn resume(&mut self, editing: bool) -> Result<()> {
 		self.running = true;
-		Ok(())
+		if !self.enabled || !self.suspended {
+			return Ok(());
+		}
+		self.suspended = false;
+		self.focused = true;
+		self.activate(editing)
 	}
 
 	fn resume_intent(&mut self, editing: bool) -> Result<()> {

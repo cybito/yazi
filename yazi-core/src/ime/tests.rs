@@ -49,7 +49,7 @@ fn assert_disabled(ime: &mut Ime) -> Result<()> {
 	ime.focus_out()?;
 	ime.stop()?;
 	assert!(!ime.running);
-	ime.resume()?;
+	ime.resume(false)?;
 	assert!(ime.running);
 	ime.input(false)?;
 	ime.quit()?;
@@ -76,7 +76,7 @@ fn missing_service_disables_reporter_without_blocking_input_or_lifecycle() -> Re
 	// A subsequently available socket cannot revive the reporter in this process.
 	let service = UnixListener::bind(fixture.root.join("missing"))?;
 	service.set_nonblocking(true)?;
-	ime.resume()?;
+	ime.resume(false)?;
 	ime.input(false)?;
 	assert_disabled(&mut ime)?;
 	assert_eq!(service.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
@@ -116,6 +116,7 @@ fn reports_mode_focus_and_lifetime_without_background_reactivation() -> Result<(
 			("blur", None, "pending"),
 			("activate", Some("text"), "applied"),
 			("suspend", None, "applied"),
+			("activate", Some("text"), "applied"),
 			("resume", Some("command"), "applied"),
 			("close", None, "applied"),
 		] {
@@ -141,7 +142,7 @@ fn reports_mode_focus_and_lifetime_without_background_reactivation() -> Result<(
 	ime.sync(false)?;
 	ime.input(false)?;
 	assert!(!ime.command_ready());
-	ime.resume()?;
+	ime.resume(true)?;
 	assert!(!ime.command_ready());
 	ime.sync(true)?;
 	ime.input(false)?;
@@ -371,7 +372,8 @@ fn herdr_pane_and_popup_streams_use_recorded_only_and_preserve_parent_handoff() 
 				("activate", Some("command")),
 				("state", Some("text")),
 				("suspend", None),
-				("resume", Some("command")),
+				("activate", Some("text")),
+				("state", Some("command")),
 				("blur", None),
 				("activate", Some("text")),
 				("close", None),
@@ -389,7 +391,7 @@ fn herdr_pane_and_popup_streams_use_recorded_only_and_preserve_parent_handoff() 
 		ime.stop()?;
 		ime.sync(false)?;
 		assert!(!ime.command_ready());
-		ime.resume()?;
+		ime.resume(true)?;
 		ime.sync(true)?;
 		assert!(!ime.command_ready());
 		ime.input(false)?;
@@ -405,65 +407,63 @@ fn herdr_pane_and_popup_streams_use_recorded_only_and_preserve_parent_handoff() 
 }
 
 #[test]
-fn child_return_keeps_parent_suspended_until_genuine_input_or_focus() -> Result<()> {
-	for focus in [false, true] {
-		for editing in [false, true] {
-			let fixture = Fixture::new()?;
-			let mut ime = fixture.reporter(("HERDR_PANE_ID", "pane-7"))?;
-			let listener = fixture.listener.try_clone()?;
-			let (returned, wait_return) = mpsc::channel();
-			let (checked, wait_checked) = mpsc::channel();
-			let service = thread::spawn(move || {
-				let mut peer = BufReader::new(listener.accept().unwrap().0);
-				open(&mut peer, json!({ "pane_id": "pane-7" }));
-				opened(&mut peer);
-				receive(&mut peer, "activate", Some("command"));
-				acknowledge(&mut peer, 1, "recorded");
-				receive(&mut peer, "suspend", None);
-				acknowledge(&mut peer, 2, "recorded");
-				let mut child = BufReader::new(listener.accept().unwrap().0);
-				open(&mut child, json!({ "pane_id": "pane-7" }));
-				opened(&mut child);
-				receive(&mut child, "activate", Some("command"));
-				acknowledge(&mut child, 1, "recorded");
-				let mut eof = String::new();
-				assert_eq!(child.read_line(&mut eof).unwrap(), 0);
-				wait_return.recv().unwrap();
-				peer.get_mut().set_nonblocking(true).unwrap();
-				let mut byte = [0];
-				assert_eq!(
-					std::io::Read::read(peer.get_mut(), &mut byte).unwrap_err().kind(),
-					std::io::ErrorKind::WouldBlock,
-					"child completion must neither send a mode nor close the retained parent stream"
-				);
-				peer.get_mut().set_nonblocking(false).unwrap();
-				checked.send(()).unwrap();
-				receive(&mut peer, "resume", Some(if editing { "text" } else { "command" }));
-				acknowledge(&mut peer, 3, "recorded");
-				receive(&mut peer, "close", None);
-				acknowledge(&mut peer, 4, "recorded");
-			});
-			ime.focus_in(false)?;
-			ime.stop()?;
-			let mut child = fixture.reporter(("HERDR_PANE_ID", "pane-7"))?;
-			child.focus_in(false)?;
-			drop(child);
-			ime.resume()?;
-			ime.sync(!editing)?;
-			ime.sync(editing)?;
-			assert!(!ime.command_ready());
-			returned.send(())?;
-			wait_checked.recv_timeout(Duration::from_secs(1))?;
-			if focus {
-				ime.focus_in(editing)?;
-			} else {
-				ime.input(editing)?;
-			}
-			assert_eq!(ime.command_ready(), !editing);
-			ime.quit()?;
-			service.join().unwrap();
-		}
+fn terminal_return_reports_own_current_mode_before_any_input() -> Result<()> {
+	for editing in [false, true] {
+		let fixture = Fixture::new()?;
+		let mut ime = fixture.reporter(("HERDR_PANE_ID", "pane-7"))?;
+		let listener = fixture.listener.try_clone()?;
+		let service = thread::spawn(move || {
+			let mut peer = BufReader::new(listener.accept().unwrap().0);
+			open(&mut peer, json!({ "pane_id": "pane-7" }));
+			opened(&mut peer);
+			receive(&mut peer, "activate", Some("command"));
+			acknowledge(&mut peer, 1, "recorded");
+			receive(&mut peer, "suspend", None);
+			acknowledge(&mut peer, 2, "recorded");
+			receive(&mut peer, "activate", Some(if editing { "text" } else { "command" }));
+			acknowledge(&mut peer, 3, "recorded");
+			receive(&mut peer, "close", None);
+			acknowledge(&mut peer, 4, "recorded");
+		});
+		ime.focus_in(false)?;
+		ime.stop()?;
+		ime.sync(editing)?;
+		assert!(!ime.command_ready());
+		ime.resume(editing)?;
+		assert_eq!(ime.command_ready(), !editing);
+		ime.sync(editing)?;
+		ime.quit()?;
+		service.join().unwrap();
 	}
+	Ok(())
+}
+
+#[test]
+fn inactive_terminal_return_cannot_authorize_or_replay_a_mode() -> Result<()> {
+	let (client, server) = UnixStream::pair()?;
+	let mut ime = reporter(client);
+	let service = thread::spawn(move || {
+		let mut peer = BufReader::new(server);
+		for (op, state, scope) in [
+			("activate", Some("command"), "applied"),
+			("suspend", None, "applied"),
+			("activate", Some("command"), "inactive"),
+			("close", None, "applied"),
+		] {
+			receive(&mut peer, op, state);
+			acknowledge(&mut peer, 1, scope);
+		}
+	});
+	ime.focus_in(false)?;
+	ime.stop()?;
+	ime.resume(false)?;
+	assert!(ime.enabled);
+	assert!(!ime.command_ready());
+	ime.sync(true)?;
+	ime.sync(false)?;
+	assert!(!ime.command_ready());
+	ime.quit()?;
+	service.join().unwrap();
 	Ok(())
 }
 

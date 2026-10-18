@@ -1,10 +1,10 @@
 //! Reports Yazi's text/command mode through one optional persistent intent connection.
 //! Source ownership and readback belong to ime-control, never to Yazi or a Herdr server.
 
-use anyhow::Result;
-
 #[cfg(unix)]
 use std::{env, io::IsTerminal};
+
+use anyhow::Result;
 #[cfg(unix)]
 use transport::{AckScope, Connection, Transport};
 
@@ -14,13 +14,15 @@ mod transport;
 /// Background sync cannot start a focus episode. Any reporter failure disables
 /// it until the next process start; ordinary input and terminal handoff continue.
 pub struct Ime {
-	enabled: bool,
-	running: bool,
-	focused: bool,
-	suspended: bool,
-	state: Option<bool>,
+	enabled:    bool,
+	running:    bool,
+	focused:    bool,
+	// Explicit terminal focus loss cannot be overridden by input or child return.
+	focus_lost: bool,
+	suspended:  bool,
+	state:      Option<bool>,
 	#[cfg(unix)]
-	transport: Option<Transport>,
+	transport:  Option<Transport>,
 	#[cfg(unix)]
 	connection: Option<Connection>,
 }
@@ -37,6 +39,7 @@ impl Ime {
 			enabled,
 			running: true,
 			focused: false,
+			focus_lost: false,
 			suspended: false,
 			state: None,
 			#[cfg(unix)]
@@ -136,7 +139,7 @@ impl Ime {
 
 	/// Genuine terminal input samples the current editing classifier, not a cached mode.
 	pub fn input(&mut self, editing: bool) -> Result<()> {
-		if !self.enabled || !self.running {
+		if !self.enabled || !self.running || self.focus_lost {
 			return Ok(());
 		}
 		if !self.focused || self.state.is_none() {
@@ -164,6 +167,7 @@ impl Ime {
 	}
 
 	pub fn focus_out(&mut self) -> Result<()> {
+		self.focus_lost = true;
 		self.focused = false;
 		self.state = None;
 		#[cfg(unix)]
@@ -174,6 +178,7 @@ impl Ime {
 	}
 
 	pub fn focus_in(&mut self, editing: bool) -> Result<()> {
+		self.focus_lost = false;
 		if !self.enabled || !self.running {
 			return Ok(());
 		}
@@ -207,6 +212,9 @@ impl Ime {
 			return Ok(());
 		}
 		self.suspended = false;
+		if self.focus_lost {
+			return Ok(());
+		}
 		self.focused = true;
 		self.activate(editing)
 	}
@@ -251,9 +259,7 @@ impl Ime {
 }
 
 impl Default for Ime {
-	fn default() -> Self {
-		Self::new()
-	}
+	fn default() -> Self { Self::new() }
 }
 
 impl Drop for Ime {

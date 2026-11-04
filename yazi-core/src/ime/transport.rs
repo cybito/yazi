@@ -1,16 +1,17 @@
 use std::{ffi::OsString, fs, io::{self, BufRead, BufReader, Write}, mem, os::{fd::{AsRawFd, FromRawFd, OwnedFd}, unix::{ffi::OsStrExt, fs::{FileTypeExt, MetadataExt}, net::UnixStream}}, path::{Component, Path, PathBuf}, time::{Duration, Instant}};
 
 use anyhow::{Result, bail};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 
 const MAX_FRAME: usize = 4096;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 const RPC_TIMEOUT: Duration = Duration::from_secs(4);
+const LABEL: &str = "imekit.intent";
 
 pub(super) enum Transport {
 	Direct(PathBuf),
-	Herdr { path: PathBuf, params: Value },
+	Hc { path: PathBuf, terminal: String },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -35,36 +36,18 @@ struct Response<'a> {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct OpenResponse<'a> {
-	id:     &'a str,
-	#[serde(default, borrow, deserialize_with = "optional")]
-	result: Option<OpenResult<'a>>,
-	#[serde(default, borrow, deserialize_with = "optional")]
-	error:  Option<OpenError<'a>>,
+struct Lifecycle<'a> {
+	op:    &'a str,
+	#[serde(default, borrow)]
+	state: Option<&'a str>,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct OpenResult<'a> {
-	#[serde(rename = "type")]
-	kind:       &'a str,
-	session:    &'a str,
-	generation: u64,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct OpenError<'a> {
-	code:    &'a str,
-	message: &'a str,
-}
-
-#[derive(Serialize)]
-struct OpenRequest<'a> {
-	id:     &'static str,
-	method: &'static str,
-	params: &'a Value,
+/// hc transport state: the reporter's intent is a herdr-core terminal label.
+struct Hc {
+	terminal: String,
+	pgid:     libc::pid_t,
+	held:     bool,
+	rpc:      u64,
 }
 
 // Optional fields may be absent, but an explicit null is not a protocol value.
@@ -79,30 +62,19 @@ impl Transport {
 		lookup: impl Fn(&str) -> Option<OsString>,
 		local_session: impl FnOnce() -> bool,
 	) -> Result<Option<Self>> {
-		if let Some(marker) = lookup("HERDR_IME_INTENT") {
-			if marker != "1" {
-				bail!("HERDR_IME_INVALID_ENV: unsupported intent marker");
+		let terminal = lookup("HC_TERMINAL_ID").filter(|value| !value.is_empty());
+		let socket = lookup("HC_TERMINAL_SOCKET").filter(|value| !value.is_empty());
+		match (terminal, socket) {
+			(Some(terminal), Some(socket)) => {
+				let terminal = terminal
+					.into_string()
+					.map_err(|_| anyhow::anyhow!("HC_IME_INVALID_ENV: invalid terminal identity"))?;
+				let path = PathBuf::from(socket);
+				validate_socket(&path, false)?;
+				return Ok(Some(Self::Hc { path, terminal }));
 			}
-			if lookup("HERDR_ENV").as_deref() != Some(std::ffi::OsStr::new("1")) {
-				bail!("HERDR_IME_INVALID_ENV: HERDR_ENV must be 1");
-			}
-			let pane = lookup("HERDR_PANE_ID").filter(|value| !value.is_empty());
-			let popup = lookup("HERDR_IME_POPUP_TERMINAL_ID").filter(|value| !value.is_empty());
-			let params = match (pane, popup) {
-				(Some(pane), None) => {
-					json!({ "pane_id": pane.to_str().ok_or_else(|| anyhow::anyhow!("HERDR_IME_INVALID_ENV: invalid pane identity"))? })
-				}
-				(None, Some(popup)) => {
-					json!({ "popup_terminal_id": popup.to_str().ok_or_else(|| anyhow::anyhow!("HERDR_IME_INVALID_ENV: invalid popup identity"))? })
-				}
-				_ => bail!("HERDR_IME_INVALID_ENV: exactly one pane or popup identity is required"),
-			};
-			let path = lookup("HERDR_SOCKET_PATH")
-				.filter(|value| !value.is_empty())
-				.ok_or_else(|| anyhow::anyhow!("HERDR_IME_INVALID_ENV: HERDR_SOCKET_PATH is required"))?;
-			let path = PathBuf::from(path);
-			validate_socket(&path)?;
-			return Ok(Some(Self::Herdr { path, params }));
+			(None, None) => {}
+			_ => bail!("HC_IME_INVALID_ENV: HC_TERMINAL_ID and HC_TERMINAL_SOCKET must both be set"),
 		}
 		if !local_session() {
 			return Ok(None);
@@ -119,68 +91,97 @@ impl Transport {
 
 	fn path(&self) -> &Path {
 		match self {
-			Self::Direct(path) | Self::Herdr { path, .. } => path,
+			Self::Direct(path) | Self::Hc { path, .. } => path,
 		}
 	}
 }
 
 pub(super) struct Connection {
 	stream:     BufReader<UnixStream>,
-	herdr:      bool,
+	hc:         Option<Hc>,
 	session:    Option<String>,
 	generation: Option<u64>,
 }
 
 impl Connection {
 	pub(super) fn connect(transport: &Transport) -> Result<Self> {
-		validate_socket(transport.path())?;
+		let hc = matches!(transport, Transport::Hc { .. });
+		let identity = validate_socket(transport.path(), !hc)?;
 		let stream = connect(transport.path(), Instant::now() + CONNECT_TIMEOUT)?;
-		let mut connection = Self {
-			stream:     BufReader::new(stream),
-			herdr:      matches!(transport, Transport::Herdr { .. }),
-			session:    None,
-			generation: None,
+		let hc = match transport {
+			Transport::Direct(_) => None,
+			Transport::Hc { path, terminal } => {
+				// The connected socket must still be the one whose trust was checked.
+				if validate_socket(path, false)? != identity {
+					bail!("IME_INVALID_PATH: socket was replaced during connect");
+				}
+				Some(Hc {
+					terminal: terminal.clone(),
+					pgid:     unsafe { libc::getpgrp() },
+					held:     false,
+					rpc:      0,
+				})
+			}
 		};
-		if let Transport::Herdr { params, .. } = transport {
-			connection.open(params)?;
-		}
-		Ok(connection)
+		Ok(Self { stream: BufReader::new(stream), hc, session: None, generation: None })
 	}
 
-	fn open(&mut self, params: &Value) -> Result<()> {
-		let mut request = serde_json::to_vec(&OpenRequest {
-			id: "ime:open",
-			method: "pane.input_intent.stream",
-			params,
-		})?;
-		request.push(b'\n');
-		let deadline = Instant::now() + RPC_TIMEOUT;
-		self.write(&request, deadline)?;
-		let (frame, length) = self.read(deadline)?;
-		let response: OpenResponse = serde_json::from_slice(&frame[..length])
-			.map_err(|error| anyhow::anyhow!("HERDR_IME_BAD_ACK: {error}"))?;
-		if response.id != "ime:open" {
-			bail!("HERDR_IME_BAD_ACK: wrong stream open request identity");
-		}
-		let result = match (response.result, response.error) {
-			(Some(result), None) => result,
-			(None, Some(error)) if !error.code.is_empty() => {
-				bail!("Herdr IME stream rejected: {}: {}", error.code, error.message)
-			}
-			_ => bail!("HERDR_IME_BAD_ACK: invalid stream open result"),
+	/// Maps a lifecycle request onto the terminal label and returns the synthetic
+	/// `recorded` ACK the reporter state machine expects from a non-direct transport.
+	fn label(&mut self, request: &[u8]) -> Result<AckScope> {
+		let lifecycle: Lifecycle = serde_json::from_slice(request)?;
+		let hc = self.hc.as_mut().expect("hc transport");
+		let state = |state: Option<&str>| match state {
+			Some(state @ ("command" | "text")) => Ok(state.to_owned()),
+			_ => Err(anyhow::anyhow!("IME request has no valid state")),
 		};
-		if result.kind != "pane_input_intent_stream_opened"
-			|| result.session.is_empty()
-			|| result.generation == 0
-		{
-			bail!("HERDR_IME_BAD_ACK: invalid stream open identity");
+		let (value, held) = match lifecycle.op {
+			"enter" => (Some("command".to_owned()), true),
+			"activate" | "resume" => (Some(state(lifecycle.state)?), true),
+			"state" => {
+				let state = state(lifecycle.state)?;
+				(hc.held.then_some(state), hc.held)
+			}
+			"blur" | "suspend" => (Some("idle".to_owned()), false),
+			"close" => (Some(String::new()), false),
+			op => bail!("IME request has unsupported op {op}"),
+		};
+		if let Some(state) = value {
+			let value = if state.is_empty() { state } else { format!("1:{}:{state}", hc.pgid) };
+			hc.rpc += 1;
+			let id = hc.rpc;
+			let mut frame = serde_json::to_vec(&json!({
+				"jsonrpc": "2.0",
+				"id": id,
+				"method": "terminal.label",
+				"params": { "terminal": hc.terminal, "labels": { LABEL: value } },
+			}))?;
+			frame.push(b'\n');
+			let deadline = Instant::now() + RPC_TIMEOUT;
+			self.write(&frame, deadline)?;
+			let (reply, length) = self.read(deadline)?;
+			let reply: Value = serde_json::from_slice(&reply[..length])
+				.map_err(|error| anyhow::anyhow!("IME_BAD_ACK: {error}"))?;
+			let labels = reply
+				.as_object()
+				.filter(|reply| !reply.contains_key("error") && reply.get("id") == Some(&json!(id)))
+				.and_then(|reply| reply.get("result")?.as_object()?.get("labels")?.as_object())
+				.ok_or_else(|| anyhow::anyhow!("IME_BAD_ACK: invalid terminal.label reply"))?;
+			let stored = labels.get(LABEL);
+			if (value.is_empty() && stored.is_some())
+				|| (!value.is_empty() && stored.and_then(Value::as_str) != Some(value.as_str()))
+			{
+				bail!("IME_BAD_ACK: terminal.label did not store the intent");
+			}
 		}
-		self.session = Some(result.session.to_owned());
-		self.generation = Some(result.generation);
-		Ok(())
+		self.hc.as_mut().expect("hc transport").held = held;
+		Ok(AckScope::Recorded)
 	}
 
 	pub(super) fn request(&mut self, request: &[u8]) -> Result<AckScope> {
+		if self.hc.is_some() {
+			return self.label(request);
+		}
 		let deadline = Instant::now() + RPC_TIMEOUT;
 		self.write(request, deadline)?;
 		let (frame, length) = self.read(deadline)?;
@@ -211,11 +212,10 @@ impl Connection {
 		if self.session.as_deref().is_some_and(|previous| previous != session) {
 			bail!("IME_BAD_ACK: changed session on an existing connection");
 		}
-		let scope = match (self.herdr, response.scope) {
-			(true, Some("recorded")) => AckScope::Recorded,
-			(false, Some("applied")) => AckScope::Applied,
-			(false, Some("inactive")) => AckScope::Inactive,
-			(false, Some("pending")) if request == b"{\"op\":\"blur\"}\n" => AckScope::Pending,
+		let scope = match response.scope {
+			Some("applied") => AckScope::Applied,
+			Some("inactive") => AckScope::Inactive,
+			Some("pending") if request == b"{\"op\":\"blur\"}\n" => AckScope::Pending,
 			_ => bail!("IME_BAD_ACK: unexpected acknowledgment scope"),
 		};
 		if self.session.is_none() {
@@ -314,9 +314,14 @@ impl Connection {
 	}
 
 	#[cfg(test)]
-	pub(super) fn from_stream(stream: UnixStream, herdr: bool) -> Self {
+	pub(super) fn from_stream(stream: UnixStream) -> Self {
 		stream.set_nonblocking(true).expect("IME test stream must support nonblocking I/O");
-		Self { stream: BufReader::new(stream), herdr, session: None, generation: None }
+		Self {
+			stream:     BufReader::new(stream),
+			hc:         None,
+			session:    None,
+			generation: None,
+		}
 	}
 }
 
@@ -349,7 +354,9 @@ fn wait_ready(fd: libc::c_int, events: libc::c_short, deadline: Instant) -> Resu
 	}
 }
 
-fn validate_socket(path: &Path) -> Result<()> {
+/// Returns the socket's `(st_dev, st_ino)`. `private` additionally requires
+/// mode 0600-or-stricter on the socket itself; hc relies on its 0700 parent.
+fn validate_socket(path: &Path, private: bool) -> Result<(u64, u64)> {
 	let uid = unsafe { libc::geteuid() };
 	if !path.is_absolute()
 		|| path
@@ -358,35 +365,38 @@ fn validate_socket(path: &Path) -> Result<()> {
 			.split(|&byte| byte == b'/')
 			.any(|part| part == b"." || part == b"..")
 	{
-		bail!("HERDR_IME_INVALID_PATH: socket path must be absolute and normalized");
+		bail!("IME_INVALID_PATH: socket path must be absolute and normalized");
 	}
 	let mut ancestor = PathBuf::new();
+	let mut identity = None;
 	for component in path.components() {
 		if !matches!(component, Component::RootDir | Component::Normal(_)) {
-			bail!("HERDR_IME_INVALID_PATH: invalid socket path component");
+			bail!("IME_INVALID_PATH: invalid socket path component");
 		}
 		ancestor.push(component.as_os_str());
 		let info = fs::symlink_metadata(&ancestor)?;
 		if info.file_type().is_symlink() {
-			bail!("HERDR_IME_INVALID_PATH: symlink traversal is forbidden");
+			bail!("IME_INVALID_PATH: symlink traversal is forbidden");
 		}
 		if ancestor == path {
-			if !info.file_type().is_socket() || info.uid() != uid || info.mode() & 0o077 != 0 {
-				bail!("HERDR_IME_INVALID_PATH: socket must be private and owned by the current UID");
+			if !info.file_type().is_socket() || info.uid() != uid || (private && info.mode() & 0o077 != 0)
+			{
+				bail!("IME_INVALID_PATH: socket must be owned by the current UID");
 			}
+			identity = Some((info.dev() as u64, info.ino()));
 		} else {
 			if !info.is_dir()
 				|| (info.uid() != uid && info.uid() != 0)
 				|| (info.mode() & 0o022 != 0 && !(info.uid() == 0 && info.mode() & 0o1000 != 0))
 			{
-				bail!("HERDR_IME_INVALID_PATH: unsafe socket ancestor");
+				bail!("IME_INVALID_PATH: unsafe socket ancestor");
 			}
 			if Some(&*ancestor) == path.parent() && (info.uid() != uid || info.mode() & 0o077 != 0) {
-				bail!("HERDR_IME_INVALID_PATH: socket parent must be private and owned by the current UID");
+				bail!("IME_INVALID_PATH: socket parent must be private and owned by the current UID");
 			}
 		}
 	}
-	Ok(())
+	identity.ok_or_else(|| anyhow::anyhow!("IME_INVALID_PATH: socket path has no target"))
 }
 
 fn connect(path: &Path, deadline: Instant) -> Result<UnixStream> {
@@ -480,7 +490,7 @@ mod tests {
 			b"{\"ok\":true,\"generation\":1,\"session\":\"final-lease\",\"scope\":\"applied\"}\n",
 		)?;
 		drop(peer);
-		let mut connection = Connection::from_stream(client, false);
+		let mut connection = Connection::from_stream(client);
 		let (frame, length) = connection.read(Instant::now() + Duration::from_millis(80))?;
 		let response: serde_json::Value = serde_json::from_slice(&frame[..length])?;
 		assert_eq!(response["session"], "final-lease");
@@ -505,7 +515,7 @@ mod tests {
 			peer.write_all(b"}\n").ok();
 		});
 		ready.recv()?;
-		let mut connection = Connection::from_stream(client, false);
+		let mut connection = Connection::from_stream(client);
 		assert!(connection.read(Instant::now() + Duration::from_millis(80)).is_err());
 		drop(connection);
 		service.join().unwrap();
